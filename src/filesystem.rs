@@ -5,6 +5,8 @@
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::fs::File;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{io, mem};
 
@@ -1188,5 +1190,53 @@ pub trait FileSystem {
     /// TODO: support this
     fn tmpfile(&self) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+}
+
+/// Allow filesystem's state to be serialized for migration.
+pub trait SerializableFileSystem {
+    /// Prepare serialization of the filesystem state.
+    ///
+    /// Called once migration is initiated.  If serialization of the filesystem state takes time,
+    /// this allows starting serialization now, so that `serialize()` has less work to do and can
+    /// finish quickly.
+    ///
+    /// This function is generally run in a separate thread, so is allowed to block and take time
+    /// to complete.  It should regularly check the value of the `cancel` bool, though, and if it
+    /// becomes set, cancel the preparation and return as soon as reasonably possible.
+    fn prepare_serialization(&self, _cancel: Arc<AtomicBool>) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "State serialization not supported",
+        ))
+    }
+
+    /// Serialize the filesystem state.
+    ///
+    /// Called during migration on the source side, when the vhost front-end requests this state in
+    /// order to put it into its migration stream and transfer it to the destination.
+    ///
+    /// This function should finish quickly and not perform complex tasks.  If such tasks are
+    /// necessary, they should be started by `prepare_serialization()` so they can be done in time
+    /// for `serialize()`.
+    fn serialize(&self, _state_pipe: File) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "State serialization not supported",
+        ))
+    }
+
+    /// Deserialize the filesystem state, and apply it.
+    ///
+    /// Called during migration on the destination side, when the vhost front-end has received this
+    /// state from the source.  We should deserialize and apply it, so we can resume where the
+    /// source has left off.
+    ///
+    /// This function should finish quickly.  Any complex tasks should be deferred, if possible.
+    fn deserialize_and_apply(&self, _state_pipe: File) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "State deserialization not supported",
+        ))
     }
 }

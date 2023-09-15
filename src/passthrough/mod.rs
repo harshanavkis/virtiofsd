@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 pub mod credentials;
+pub mod device_state;
 pub mod file_handle;
 pub mod inode_store;
 pub mod mount_fd;

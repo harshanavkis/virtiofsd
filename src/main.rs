@@ -9,10 +9,13 @@ use passthrough::xattrmap::XattrMap;
 use std::collections::HashSet;
 use std::convert::{self, TryFrom, TryInto};
 use std::ffi::CString;
+use std::fs::File;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::{env, error, fmt, io, process};
 use virtiofsd::idmap::{GidMap, UidMap};
@@ -31,7 +34,7 @@ use virtio_bindings::bindings::virtio_ring::{
 };
 use virtio_queue::{DescriptorChain, QueueOwnedT};
 use virtiofsd::descriptor_utils::{Error as VufDescriptorError, Reader, Writer};
-use virtiofsd::filesystem::FileSystem;
+use virtiofsd::filesystem::{FileSystem, SerializableFileSystem};
 use virtiofsd::passthrough::{self, CachePolicy, InodeFileHandlesMode, PassthroughFs};
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
 use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
@@ -146,7 +149,7 @@ impl<F: FileSystem + Send + Sync + 'static> Clone for VhostUserFsThread<F> {
     }
 }
 
-impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
+impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
     fn new(fs: F, thread_pool_size: usize) -> Result<Self> {
         let pool = if thread_pool_size > 0 {
             // Test that unshare(CLONE_FS) works, it will be called for each thread.
@@ -400,19 +403,33 @@ impl Default for VirtioFsConfig {
 
 unsafe impl ByteValued for VirtioFsConfig {}
 
-struct VhostUserFsBackend<F: FileSystem + Send + Sync + 'static> {
+struct PremigrationThread {
+    handle: JoinHandle<io::Result<()>>,
+    cancel: Arc<AtomicBool>,
+}
+
+struct VhostUserFsBackend<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> {
     thread: RwLock<VhostUserFsThread<F>>,
+    premigration_thread: Mutex<Option<PremigrationThread>>,
+    migration_thread: Mutex<Option<JoinHandle<io::Result<()>>>>,
     tag: Option<String>,
 }
 
-impl<F: FileSystem + Send + Sync + 'static> VhostUserFsBackend<F> {
+impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFsBackend<F> {
     fn new(fs: F, thread_pool_size: usize, tag: Option<String>) -> Result<Self> {
         let thread = RwLock::new(VhostUserFsThread::new(fs, thread_pool_size)?);
-        Ok(VhostUserFsBackend { thread, tag })
+        Ok(VhostUserFsBackend {
+            thread,
+            premigration_thread: None.into(),
+            migration_thread: None.into(),
+            tag,
+        })
     }
 }
 
-impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBackend<F> {
+impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserBackend
+    for VhostUserFsBackend<F>
+{
     type Bitmap = BitmapMmapRegion;
     type Vring = VringMutex<LoggedMemoryAtomic>;
 
@@ -438,7 +455,8 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
             | VhostUserProtocolFeatures::BACKEND_SEND_FD
             | VhostUserProtocolFeatures::REPLY_ACK
             | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
-            | VhostUserProtocolFeatures::LOG_SHMFD;
+            | VhostUserProtocolFeatures::LOG_SHMFD
+            | VhostUserProtocolFeatures::DEVICE_STATE;
 
         if self.tag.is_some() {
             protocol_features |= VhostUserProtocolFeatures::CONFIG;
@@ -480,6 +498,35 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
         result
     }
 
+    fn acked_features(&self, features: u64) {
+        if features & VhostUserVirtioFeatures::LOG_ALL.bits() != 0 {
+            // F_LOG_ALL set: Prepare for migration (unless we're already doing that)
+            let mut premigration_thread = self.premigration_thread.lock().unwrap();
+            if premigration_thread.is_none() {
+                let cancel = Arc::new(AtomicBool::new(false));
+                let cloned_server = Arc::clone(&self.thread.read().unwrap().server);
+                let cloned_cancel = Arc::clone(&cancel);
+                let handle =
+                    thread::spawn(move || cloned_server.prepare_serialization(cloned_cancel));
+                *premigration_thread = Some(PremigrationThread { handle, cancel });
+            }
+        } else {
+            // F_LOG_ALL cleared: Migration cancelled, if any was ongoing
+            // (Note that this is our interpretation, and not said by the specification.  The back
+            // end might clear this flag also on the source side once the VM has been stopped, even
+            // before we receive SET_DEVICE_STATE_FD.  QEMU will clear F_LOG_ALL only when the VM
+            // is running, i.e. when the source resumes after a cancelled migration, which is
+            // exactly what we want, but it would be better if we had a more reliable way that is
+            // backed up by the spec.  We could delay cancelling until we receive a guest request
+            // while F_LOG_ALL is cleared, but that can take an indefinite amount of time.)
+            if let Some(premigration_thread) = self.premigration_thread.lock().unwrap().take() {
+                premigration_thread.cancel.store(true, Ordering::Relaxed);
+                // Ignore the result, we are cancelling anyway
+                let _ = premigration_thread.handle.join();
+            }
+        }
+    }
+
     fn set_event_idx(&self, enabled: bool) {
         self.thread.write().unwrap().event_idx = enabled;
     }
@@ -515,6 +562,83 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
 
     fn set_backend_req_fd(&self, vu_req: Backend) {
         self.thread.write().unwrap().vu_req = Some(vu_req);
+    }
+
+    fn set_device_state_fd(
+        &self,
+        direction: VhostTransferStateDirection,
+        phase: VhostTransferStatePhase,
+        file: File,
+    ) -> io::Result<Option<File>> {
+        if phase != VhostTransferStatePhase::STOPPED {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Transfer in phase {:?} is not supported", phase),
+            ));
+        }
+
+        let server = Arc::clone(&self.thread.read().unwrap().server);
+        let join_handle = match direction {
+            VhostTransferStateDirection::SAVE => {
+                if let Some(premigration_thread) = self.premigration_thread.lock().unwrap().take() {
+                    // It isn't great to have this vhost-user message block, but if the
+                    // preparations are still ongoing, we have no choice
+                    premigration_thread.handle.join().map_err(|_| {
+                        other_io_error("Failed to finalize serialization preparation".to_string())
+                    })??;
+                }
+
+                thread::spawn(move || {
+                    server.serialize(file).map_err(|e| {
+                        io::Error::new(e.kind(), format!("Failed to save state: {}", e))
+                    })
+                })
+            }
+
+            VhostTransferStateDirection::LOAD => {
+                if let Some(premigration_thread) = self.premigration_thread.lock().unwrap().take() {
+                    // Strange, but OK
+                    premigration_thread.cancel.store(true, Ordering::Relaxed);
+                    warn!("Cancelling serialization preparation because of incoming migration");
+                    let _ = premigration_thread.handle.join();
+                }
+
+                thread::spawn(move || {
+                    server.deserialize_and_apply(file).map_err(|e| {
+                        io::Error::new(e.kind(), format!("Failed to load state: {}", e))
+                    })
+                })
+            }
+        };
+
+        *self.migration_thread.lock().unwrap() = Some(join_handle);
+
+        Ok(None)
+    }
+
+    fn check_device_state(&self) -> io::Result<()> {
+        let result = if let Some(migration_thread) = self.migration_thread.lock().unwrap().take() {
+            // `Result::flatten()` is not stable yet, so no `.join().map_err(...).flatten()`
+            match migration_thread.join() {
+                Ok(x) => x,
+                Err(_) => Err(other_io_error("Failed to join the migration thread")),
+            }
+        } else {
+            // `check_device_state()` must follow a successful `set_device_state_fd()`, so this is
+            // a protocol violation
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Front-end attempts to check migration state, but no migration has been done",
+            ))
+        };
+
+        // Note that just like any other vhost-user message implementation, the error object that
+        // we return is not forwarded to the front end (it only receives an error flag), so if we
+        // want users to see some diagnostics, we have to print them ourselves
+        if let Err(e) = &result {
+            error!("Migration failed: {e}");
+        }
+        result
     }
 }
 

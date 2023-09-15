@@ -6,7 +6,7 @@ use super::fs_cache_req_handler::FsCacheReqHandler;
 use crate::descriptor_utils::{Reader, Writer};
 use crate::filesystem::{
     Context, DirEntry, DirectoryIterator, Entry, Extensions, FileSystem, GetxattrReply,
-    ListxattrReply, SecContext, ZeroCopyReader, ZeroCopyWriter,
+    ListxattrReply, SecContext, SerializableFileSystem, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::fuse::*;
 use crate::passthrough::util::einval;
@@ -16,7 +16,8 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::{size_of, MaybeUninit};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use vm_memory::ByteValued;
 
@@ -1521,6 +1522,20 @@ impl<F: FileSystem + Sync> Server<F> {
             .err()
             .unwrap_or_else(|| panic!("unsupported operation"));
         reply_error(e, in_header.unique, w)
+    }
+}
+
+impl<F: FileSystem + SerializableFileSystem + Sync> SerializableFileSystem for Server<F> {
+    fn prepare_serialization(&self, cancel: Arc<AtomicBool>) -> io::Result<()> {
+        self.fs.prepare_serialization(cancel)
+    }
+
+    fn serialize(&self, state_pipe: File) -> io::Result<()> {
+        self.fs.serialize(state_pipe)
+    }
+
+    fn deserialize_and_apply(&self, state_pipe: File) -> io::Result<()> {
+        self.fs.deserialize_and_apply(state_pipe)
     }
 }
 
