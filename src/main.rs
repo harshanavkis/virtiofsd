@@ -22,6 +22,7 @@ use clap::{CommandFactory, Parser};
 use vhost::vhost_user::message::*;
 use vhost::vhost_user::Error::Disconnected;
 use vhost::vhost_user::{Backend, Listener};
+use vhost_user_backend::bitmap::BitmapMmapRegion;
 use vhost_user_backend::Error::HandleRequest;
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringMutex, VringState, VringT};
 use virtio_bindings::bindings::virtio_config::*;
@@ -50,6 +51,9 @@ const REQUEST_QUEUES: u32 = 1;
 // Since VIRTIO_FS_F_NOTIFICATION is not advertised we do not have a
 // notification queue.
 const NUM_QUEUES: usize = REQUEST_QUEUES as usize + 1;
+
+type LoggedMemory = GuestMemoryMmap<BitmapMmapRegion>;
+type LoggedMemoryAtomic = GuestMemoryAtomic<LoggedMemory>;
 
 // The guest queued an available buffer for the high priority queue.
 const HIPRIO_QUEUE_EVENT: u16 = 0;
@@ -120,7 +124,7 @@ impl convert::From<Error> for io::Error {
 }
 
 struct VhostUserFsThread<F: FileSystem + Send + Sync + 'static> {
-    mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    mem: Option<LoggedMemoryAtomic>,
     kill_evt: EventFd,
     server: Arc<Server<F>>,
     // handle request from backend to frontend
@@ -182,7 +186,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
     }
 
     fn return_descriptor(
-        vring_state: &mut VringState,
+        vring_state: &mut VringState<LoggedMemoryAtomic>,
         head_index: u16,
         event_idx: bool,
         len: usize,
@@ -213,7 +217,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
         }
     }
 
-    fn process_queue_pool(&self, vring: VringMutex) -> Result<bool> {
+    fn process_queue_pool(&self, vring: VringMutex<LoggedMemoryAtomic>) -> Result<bool> {
         let mut used_any = false;
         let atomic_mem = match &self.mem {
             Some(m) => m,
@@ -260,7 +264,10 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
         Ok(used_any)
     }
 
-    fn process_queue_serial(&self, vring_state: &mut VringState) -> Result<bool> {
+    fn process_queue_serial(
+        &self,
+        vring_state: &mut VringState<LoggedMemoryAtomic>,
+    ) -> Result<bool> {
         let mut used_any = false;
         let mem = match &self.mem {
             Some(m) => m.memory(),
@@ -268,7 +275,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
         };
         let mut vu_req = self.vu_req.clone();
 
-        let avail_chains: Vec<DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap>>> = vring_state
+        let avail_chains: Vec<DescriptorChain<GuestMemoryLoadGuard<LoggedMemory>>> = vring_state
             .get_queue_mut()
             .iter(mem.clone())
             .map_err(|_| Error::IterateQueue)?
@@ -301,7 +308,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
     fn handle_event_pool(
         &self,
         device_event: u16,
-        vrings: &[VringMutex],
+        vrings: &[VringMutex<LoggedMemoryAtomic>],
     ) -> VhostUserBackendResult<()> {
         let idx = match device_event {
             HIPRIO_QUEUE_EVENT => {
@@ -338,7 +345,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
     fn handle_event_serial(
         &self,
         device_event: u16,
-        vrings: &[VringMutex],
+        vrings: &[VringMutex<LoggedMemoryAtomic>],
     ) -> VhostUserBackendResult<()> {
         let mut vring_state = match device_event {
             HIPRIO_QUEUE_EVENT => {
@@ -406,8 +413,8 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsBackend<F> {
 }
 
 impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBackend<F> {
-    type Bitmap = ();
-    type Vring = VringMutex;
+    type Bitmap = BitmapMmapRegion;
+    type Vring = VringMutex<LoggedMemoryAtomic>;
 
     fn num_queues(&self) -> usize {
         NUM_QUEUES
@@ -422,6 +429,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
             | 1 << VIRTIO_RING_F_INDIRECT_DESC
             | 1 << VIRTIO_RING_F_EVENT_IDX
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
+            | VhostUserVirtioFeatures::LOG_ALL.bits()
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
@@ -429,7 +437,8 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
             | VhostUserProtocolFeatures::BACKEND_REQ
             | VhostUserProtocolFeatures::BACKEND_SEND_FD
             | VhostUserProtocolFeatures::REPLY_ACK
-            | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS;
+            | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
+            | VhostUserProtocolFeatures::LOG_SHMFD;
 
         if self.tag.is_some() {
             protocol_features |= VhostUserProtocolFeatures::CONFIG;
@@ -475,7 +484,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
         self.thread.write().unwrap().event_idx = enabled;
     }
 
-    fn update_memory(&self, mem: GuestMemoryAtomic<GuestMemoryMmap>) -> VhostUserBackendResult<()> {
+    fn update_memory(&self, mem: LoggedMemoryAtomic) -> VhostUserBackendResult<()> {
         self.thread.write().unwrap().mem = Some(mem);
         Ok(())
     }
@@ -484,7 +493,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
         &self,
         device_event: u16,
         evset: EventSet,
-        vrings: &[VringMutex],
+        vrings: &[VringMutex<LoggedMemoryAtomic>],
         _thread_id: usize,
     ) -> VhostUserBackendResult<()> {
         if evset != EventSet::IN {

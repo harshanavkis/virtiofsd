@@ -10,6 +10,7 @@ use std::ops::Deref;
 use std::ptr::copy_nonoverlapping;
 use std::{cmp, result};
 
+use vhost_user_backend::bitmap::BitmapMmapRegion;
 use virtio_queue::DescriptorChain;
 use vm_memory::bitmap::{Bitmap, BitmapSlice};
 use vm_memory::{
@@ -184,7 +185,7 @@ impl<'a, B: BitmapSlice> DescriptorChainConsumer<'a, B> {
 /// Reader will skip iterating over descriptor chain when first writable
 /// descriptor is encountered.
 #[derive(Clone)]
-pub struct Reader<'a, B = ()> {
+pub struct Reader<'a, B = BitmapMmapRegion> {
     buffer: DescriptorChainConsumer<'a, B>,
 }
 
@@ -314,7 +315,7 @@ impl<'a, B: BitmapSlice> io::Read for Reader<'a, B> {
 /// Writer will start iterating the descriptors from the first writable one and will
 /// assume that all following descriptors are writable.
 #[derive(Clone)]
-pub struct Writer<'a, B = ()> {
+pub struct Writer<'a, B = BitmapMmapRegion> {
     buffer: DescriptorChainConsumer<'a, B>,
 }
 
