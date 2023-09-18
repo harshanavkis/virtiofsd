@@ -262,6 +262,12 @@ pub struct Config {
     /// If `clean_noatime` is true automatically clean up O_NOATIME flag to prevent potential
     /// permission errors.
     pub clean_noatime: bool,
+
+    /// If `allow_mmap` is true, then server will allow shared mmap'ing of files opened/created
+    /// with DIRECT_IO.
+    ///
+    /// The default is `false`.
+    pub allow_mmap: bool,
 }
 
 impl Default for Config {
@@ -286,6 +292,7 @@ impl Default for Config {
             posix_acl: false,
             security_label: false,
             clean_noatime: true,
+            allow_mmap: false,
         }
     }
 }
@@ -1200,6 +1207,10 @@ impl FileSystem for PassthroughFs {
                 error!("Cannot enable security label. kernel does not support FUSE_SECURITY_CTX capability");
                 return Err(io::Error::from_raw_os_error(libc::EPROTO));
             }
+        }
+
+        if self.cfg.allow_mmap {
+            opts |= FsOptions::DIRECT_IO_ALLOW_MMAP;
         }
 
         if capable.contains(FsOptions::CREATE_SUPP_GROUP) {
