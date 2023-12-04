@@ -29,13 +29,23 @@ pub struct ReadDir<P> {
 }
 
 impl<P: DerefMut<Target = [u8]>> ReadDir<P> {
-    pub fn new<D: AsRawFd>(dir: &D, offset: libc::off64_t, mut buf: P) -> io::Result<Self> {
+    pub fn new<D: AsRawFd>(dir: &D, offset: libc::off64_t, buf: P) -> io::Result<Self> {
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::lseek64(dir.as_raw_fd(), offset, libc::SEEK_SET) };
         if res < 0 {
             return Err(io::Error::last_os_error());
         }
 
+        // Safe because we used lseek() to get to the correct position
+        unsafe { Self::new_no_seek(dir, buf) }
+    }
+
+    /// Continue reading from the current position in the directory without seeking.
+    ///
+    /// # Safety
+    /// Caller must ensure the current position is valid, for example, by exclusively using this
+    /// function on a given FD, potentially repeatedly.
+    pub unsafe fn new_no_seek<D: AsRawFd>(dir: &D, mut buf: P) -> io::Result<Self> {
         // Safe because the kernel guarantees that it will only write to `buf` and we check the
         // return value.
         let res = unsafe {
