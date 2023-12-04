@@ -1,12 +1,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
+use crate::fuse;
 use crate::passthrough::device_state::preserialization::{InodeLocation, InodeMigrationInfo};
 use crate::passthrough::file_handle::{FileHandle, FileOrHandle};
 use crate::passthrough::stat::MountId;
-use crate::passthrough::util::{ebadf, is_safe_inode, reopen_fd_through_proc};
+use crate::passthrough::util::{ebadf, get_path_by_fd, is_safe_inode, reopen_fd_through_proc};
 use crate::util::other_io_error;
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::fs::File;
 use std::io;
 use std::ops::Deref;
@@ -16,7 +18,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub type Inode = u64;
 
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct InodeIds {
     pub ino: libc::ino64_t,
     pub dev: libc::dev_t,
@@ -96,6 +98,22 @@ impl<'a> InodeData {
             }
             FileOrHandle::Invalid(err) => Err(io::Error::new(err.kind(), Arc::clone(err))),
         }
+    }
+
+    /// Try to obtain this inode's path through /proc/self/fd
+    pub fn get_path(&self, proc_self_fd: &File) -> io::Result<CString> {
+        let path = get_path_by_fd(&self.get_file()?, proc_self_fd)?;
+
+        // Kernel will report nodes beyond our root as having path / -- but only the root node (the
+        // shared directory) can actually have that path, so for others, it must be inaccurate
+        if path.as_bytes() == b"/" && self.inode != fuse::ROOT_ID {
+            return Err(other_io_error(
+                "Got empty path for non-root node, so it is outside the shared directory"
+                    .to_string(),
+            ));
+        }
+
+        Ok(path)
     }
 
     /// Open this inode with the given flags

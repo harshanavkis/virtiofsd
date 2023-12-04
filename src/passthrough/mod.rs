@@ -47,7 +47,6 @@ type Handle = u64;
 
 enum HandleDataFile {
     File(RwLock<File>),
-    #[allow(dead_code)] // will be constructed once deserialization is implemented
     // `io::Error` does not implement `Clone`, so without wrapping it in `Arc`, returning the error
     // anywhere would be impossible without consuming it
     Invalid(Arc<io::Error>),
