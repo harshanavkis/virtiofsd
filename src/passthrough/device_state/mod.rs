@@ -6,11 +6,40 @@
  * Module for migrating our internal FS state (i.e. serializing and deserializing it), with the
  * following submodules:
  * - serialized: Serialized data structures
+ * - preserialization: Structures and functionality for preparing for migration (serialization),
+ *                     i.e. define and construct the precursors to the eventually serialized
+ *                     information that are stored alongside the associated inodes and handles they
+ *                     describe
  */
+pub(super) mod preserialization;
 mod serialized;
 
 use crate::filesystem::SerializableFileSystem;
 use crate::passthrough::PassthroughFs;
+use preserialization::{InodeMigrationInfoConstructor, PathReconstructor};
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Adds serialization (migration) capabilities to `PassthroughFs`
-impl SerializableFileSystem for PassthroughFs {}
+impl SerializableFileSystem for PassthroughFs {
+    fn prepare_serialization(&self, cancel: Arc<AtomicBool>) -> io::Result<()> {
+        self.inodes.clear_migration_info();
+
+        // Set this so the filesystem code knows that every node is supposed to have up-to-date
+        // migration information.  For example, nodes that are created after they would have been
+        // visited by the reconstructor below will not get migration info, unless the general
+        // filesystem code makes an effort to set it (when the node is created).
+        self.track_migration_info.store(true, Ordering::Relaxed);
+
+        // Create the reconstructor (which reconstructs parent+filename information for each node
+        // in our inode store), and run it
+        let reconstructor = PathReconstructor::new(self, cancel);
+        let result = reconstructor.execute();
+        if result.is_err() {
+            // Do not leave incomplete data behind (cancelling returns an error, too, landing here)
+            self.inodes.clear_migration_info();
+        }
+        result
+    }
+}

@@ -17,6 +17,7 @@ use crate::filesystem::{
     SecContext, SetattrValid, SetxattrFlags, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::passthrough::credentials::{drop_effective_cap, UnixCredentials};
+use crate::passthrough::device_state::preserialization::{HandleMigrationInfo, InodeMigrationInfo};
 use crate::passthrough::inode_store::{
     Inode, InodeData, InodeFile, InodeIds, InodeStore, StrongInodeReference,
 };
@@ -36,7 +37,7 @@ use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use xattrmap::{AppliedRule, XattrMap};
 
@@ -55,6 +56,12 @@ enum HandleDataFile {
 struct HandleData {
     inode: Inode,
     file: HandleDataFile,
+
+    // On migration, must be set when we serialize our internal state to send it to the
+    // destination.  As long as `HandleMigrationInfo::new()` is cheap, we may as well
+    // keep it always set.
+    #[allow(dead_code)] // will be used once serialization is implemented
+    migration_info: HandleMigrationInfo,
 }
 
 struct ScopedWorkingDirectory {
@@ -397,6 +404,10 @@ pub struct PassthroughFs {
     // Whether the guest kernel supports the supplementary group extension.
     sup_group_extension: AtomicBool,
 
+    // Whether we are preparing for migration and need to track changes to inodes like renames.  We
+    // should then also make sure newly created inodes immediately have their migration info set.
+    track_migration_info: AtomicBool,
+
     cfg: Config,
 }
 
@@ -446,6 +457,7 @@ impl PassthroughFs {
             posix_acl: AtomicBool::new(false),
             sup_group_extension: AtomicBool::new(false),
             os_facts: oslib::OsFacts::new(),
+            track_migration_info: AtomicBool::new(false),
             cfg,
         };
 
@@ -734,7 +746,6 @@ impl PassthroughFs {
     /// strong reference to it.  Otherwise, return `None`.
     /// Return an error if the parent node cannot be opened, the given inode cannot be found on the
     /// filesystem, or generating the Stat information or file handle fails.
-    #[allow(unused)]
     fn try_lookup(
         &self,
         parent_data: &InodeData,
@@ -766,6 +777,18 @@ impl PassthroughFs {
                 FileOrHandle::File(path_fd)
             };
 
+            let mig_info = if self.track_migration_info.load(Ordering::Relaxed) {
+                let parent_strong_ref = StrongInodeReference::new_with_data(p, &self.inodes)?;
+                Some(InodeMigrationInfo::new(
+                    &self.cfg,
+                    parent_strong_ref,
+                    name,
+                    &file_or_handle,
+                )?)
+            } else {
+                None
+            };
+
             let inode_data = InodeData {
                 inode: self.next_inode.fetch_add(1, Ordering::Relaxed),
                 file_or_handle,
@@ -776,6 +799,7 @@ impl PassthroughFs {
                     mnt_id: st.mnt_id,
                 },
                 mode: st.st.st_mode,
+                migration_info: Mutex::new(mig_info),
             };
             self.inodes.get_or_insert(inode_data)?
         };
@@ -827,6 +851,7 @@ impl PassthroughFs {
         let data = HandleData {
             inode,
             file: file.into(),
+            migration_info: HandleMigrationInfo::new(flags as i32),
         };
 
         self.handles.write().unwrap().insert(handle, Arc::new(data));
@@ -1132,8 +1157,36 @@ impl PassthroughFs {
                 mnt_id: st.mnt_id,
             },
             mode: st.st.st_mode,
+            migration_info: Mutex::new(None),
         };
         self.inodes.new_inode(inode)?;
+        Ok(())
+    }
+
+    /// After renaming an inode while preparing for migration, update its migration info if
+    /// necessary.  For example, when representing inodes through their filename and parent
+    /// directory node, these must be updated to match the new name and location.
+    /// `parent` and `filename` are the inode's new location.
+    fn update_inode_migration_info(
+        &self,
+        parent_data: Arc<InodeData>,
+        filename: &CStr,
+    ) -> io::Result<()> {
+        // We only need to update the node's migration info if we have it in our store
+        if let Some(inode) = self.try_lookup(&parent_data, filename)? {
+            let inode_data = inode.get();
+            let parent_strong_ref = StrongInodeReference::new_with_data(parent_data, &self.inodes)?;
+            let mut info_locked = inode_data.migration_info.lock().unwrap();
+            // Unconditionally clear any potentially existing path, because it will be outdated
+            info_locked.take();
+            *info_locked = Some(InodeMigrationInfo::new(
+                &self.cfg,
+                parent_strong_ref,
+                filename,
+                &inode_data.file_or_handle,
+            )?);
+        }
+
         Ok(())
     }
 }
@@ -1408,6 +1461,7 @@ impl FileSystem for PassthroughFs {
                 let data = HandleData {
                     inode: entry.inode,
                     file: file.into(),
+                    migration_info: HandleMigrationInfo::new(flags as i32),
                 };
 
                 self.handles.write().unwrap().insert(handle, Arc::new(data));
@@ -1718,11 +1772,22 @@ impl FileSystem for PassthroughFs {
                 flags,
             )
         };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        if res != 0 {
+            return Err(io::Error::last_os_error());
         }
+
+        if self.track_migration_info.load(Ordering::Relaxed) {
+            // When preparing for migration, we need to tell the migration code that this node has
+            // been renamed, which might need to be reflected in the migration info
+            if let Err(err) = self.update_inode_migration_info(new_inode, newname) {
+                warn!(
+                    "Failed to update renamed file's ({oldname:?} -> {newname:?}) migration info, \
+                    the migration destination may be unable to find it: {err}",
+                );
+            }
+        }
+
+        Ok(())
     }
 
     fn mknod(

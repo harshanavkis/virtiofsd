@@ -1,6 +1,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
+use crate::passthrough::device_state::preserialization::{InodeLocation, InodeMigrationInfo};
 use crate::passthrough::file_handle::{FileHandle, FileOrHandle};
 use crate::passthrough::stat::MountId;
 use crate::passthrough::util::{ebadf, is_safe_inode, reopen_fd_through_proc};
@@ -11,7 +12,7 @@ use std::io;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 pub type Inode = u64;
 
@@ -48,6 +49,16 @@ pub struct InodeData {
 
     // File type and mode
     pub mode: u32,
+
+    // Constructed in the `prepare_serialization` phase of migration, and must be set on all inodes
+    // when we are actually going to serialize our internal state to send it to the migration
+    // destination.
+    // Because this may contain a strong inode reference, which must not be dropped while the inode
+    // store is locked, this info must in turn not be dropped while the store is locked.
+    // To ensure this, locking of the store is only done here in this file, and here we ensure that
+    // while the store is locked, `InodeMigrationInfo` (e.g. as part of an `InodeData`) is dropped
+    // only by using `drop_unlocked()` for a potentially contained strong reference.
+    pub(super) migration_info: Mutex<Option<InodeMigrationInfo>>,
 }
 
 /**
@@ -138,29 +149,60 @@ impl AsRawFd for InodeFile<'_> {
 }
 
 impl InodeStoreInner {
-    fn insert(&mut self, data: Arc<InodeData>) {
+    /// Insert a new entry into the inode store.  Panics if the entry already existed.
+    /// (This guarantees that inserting a value will not drop an existing `InodeMigrationInfo`
+    /// object.)
+    fn insert_new(&mut self, data: Arc<InodeData>) {
+        // Overwriting something in `by_ids` or `by_handle` is not exactly what we want, but having
+        // the same physical inode under several different FUSE IDs is not catastrophic, so do not
+        // panic about that.
         self.by_ids.insert(data.ids, data.inode);
         if let FileOrHandle::Handle(handle) = &data.file_or_handle {
             self.by_handle.insert(handle.inner().clone(), data.inode);
         }
-        self.data.insert(data.inode, data);
+        let existing = self.data.insert(data.inode, data);
+        assert!(existing.is_none());
     }
 
-    fn remove(&mut self, inode: Inode) -> Option<Arc<InodeData>> {
+    /// Remove the given inode, and, if found, take care to drop any associated strong reference in
+    /// the migration info via `drop_unlocked()`.
+    fn remove(&mut self, inode: Inode) {
         let data = self.data.remove(&inode);
-        if let Some(data) = data.as_ref() {
+        if let Some(data) = data {
             if let FileOrHandle::Handle(handle) = &data.file_or_handle {
                 self.by_handle.remove(handle.inner());
             }
             self.by_ids.remove(&data.ids);
+            if let Some(mig_info) = data.migration_info.lock().unwrap().take() {
+                match mig_info.location {
+                    InodeLocation::RootNode => (),
+                    InodeLocation::Path { parent, .. } => parent.drop_unlocked(self),
+                }
+            }
         }
-        data
     }
 
     fn clear(&mut self) {
+        self.clear_migration_info();
         self.data.clear();
         self.by_handle.clear();
         self.by_ids.clear();
+    }
+
+    /// Clears all migration info, using `drop_unlocked()` to drop any strong references within.
+    fn clear_migration_info(&mut self) {
+        let mut strong_references = Vec::<StrongInodeReference>::new();
+        for inode in self.data.values() {
+            if let Some(mig_info) = inode.migration_info.lock().unwrap().take() {
+                match mig_info.location {
+                    InodeLocation::RootNode => (),
+                    InodeLocation::Path { parent, .. } => strong_references.push(parent),
+                }
+            }
+        }
+        for strong_reference in strong_references {
+            strong_reference.drop_unlocked(self);
+        }
     }
 
     fn get(&self, inode: Inode) -> Option<&Arc<InodeData>> {
@@ -311,9 +353,15 @@ impl InodeStore {
             FileOrHandle::Invalid(_) => None,
         };
         if let Ok(inode) = self.do_claim_inode(&inner, handle, &inode_data.ids) {
+            // `InodeData`s should not be dropped while the inode store is locked, so drop the lock
+            // before `inode_data`
+            drop(inner);
             return Ok(inode);
         }
         if inner.contains(inode_data.inode) {
+            // `InodeData`s should not be dropped while the inode store is locked, so drop the lock
+            // before `inode_data`
+            drop(inner);
             return Err(other_io_error(format!(
                 "Double-use of FUSE inode ID {}",
                 inode_data.inode
@@ -323,7 +371,7 @@ impl InodeStore {
         // Safe because we have the only reference
         inode_data.refcount = AtomicU64::new(1);
         let inode_data = Arc::new(inode_data);
-        inner.insert(Arc::clone(&inode_data));
+        inner.insert_new(Arc::clone(&inode_data));
 
         // We just set the reference to 1 to account for this
         Ok(unsafe { StrongInodeReference::new_no_increment(inode_data, self) })
@@ -335,12 +383,15 @@ impl InodeStore {
     pub fn new_inode(&self, inode_data: InodeData) -> io::Result<()> {
         let mut inner = self.inner.write().unwrap();
         if inner.contains(inode_data.inode) {
+            // `InodeData`s should not be dropped while the inode store is locked, so drop the lock
+            // before `inode_data`
+            drop(inner);
             return Err(other_io_error(format!(
                 "Double-use of FUSE inode ID {}",
                 inode_data.inode
             )));
         }
-        inner.insert(Arc::new(inode_data));
+        inner.insert_new(Arc::new(inode_data));
         Ok(())
     }
 
@@ -361,6 +412,10 @@ impl InodeStore {
 
     pub fn clear(&self) {
         self.inner.write().unwrap().clear();
+    }
+
+    pub fn clear_migration_info(&self) {
+        self.inner.write().unwrap().clear_migration_info();
     }
 }
 
@@ -456,6 +511,14 @@ impl StrongInodeReference {
         // outside of them, this must always be `None`.
         self.inode_data.as_ref().unwrap()
     }
+
+    /// This function allows dropping a `StrongInodeReference` while the inode store is locked, but
+    /// the caller must have mutable access to the inode store.
+    fn drop_unlocked(mut self, inodes: &mut InodeStoreInner) {
+        if let Some(inode_data) = self.inode_data.take() {
+            inodes.forget_one(inode_data.inode, 1);
+        }
+    }
 }
 
 impl Clone for StrongInodeReference {
@@ -491,5 +554,14 @@ impl Drop for StrongInodeReference {
                 .unwrap()
                 .forget_one(inode_data.inode, 1);
         }
+    }
+}
+
+impl Drop for InodeStore {
+    /// Explicitly clear the inner inode store on drop, because there may be circular references
+    /// within (in the migration info's strong references) that may otherwise prevent the
+    /// `InodeStoreInner` from being dropped.
+    fn drop(&mut self) {
+        self.inner.write().unwrap().clear();
     }
 }
