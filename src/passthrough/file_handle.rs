@@ -5,6 +5,7 @@
 use crate::oslib;
 use crate::passthrough::mount_fd::{MPRResult, MountFd, MountFds};
 use crate::passthrough::stat::MountId;
+use serde::{Deserialize, Serialize};
 use std::convert::{TryFrom, TryInto};
 use std::ffi::CStr;
 use std::fs::File;
@@ -25,7 +26,7 @@ pub struct OpenableFileHandle {
     mount_fd: Arc<MountFd>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SerializableFileHandle {
     mnt_id: u64,
     handle_type: i32,
