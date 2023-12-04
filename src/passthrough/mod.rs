@@ -1002,14 +1002,8 @@ impl PassthroughFs {
             Err(res_err)
         }
     }
-}
 
-impl FileSystem for PassthroughFs {
-    type Inode = Inode;
-    type Handle = Handle;
-    type DirIter = ReadDir<Vec<u8>>;
-
-    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+    pub fn open_root_node(&self) -> io::Result<()> {
         // We use `O_PATH` because we just want this for traversing the directory tree
         // and not for actually reading the contents. We don't use `open_relative_to()`
         // here because we are not opening a guest-provided pathname. Also, `self.cfg.root_dir`
@@ -1043,6 +1037,17 @@ impl FileSystem for PassthroughFs {
             mode: st.st.st_mode,
         };
         self.inodes.new_inode(inode)?;
+        Ok(())
+    }
+}
+
+impl FileSystem for PassthroughFs {
+    type Inode = Inode;
+    type Handle = Handle;
+    type DirIter = ReadDir<Vec<u8>>;
+
+    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        self.open_root_node()?;
 
         let mut opts = if self.cfg.readdirplus {
             FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO
