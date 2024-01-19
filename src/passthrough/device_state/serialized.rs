@@ -85,6 +85,15 @@ pub(super) enum InodeLocation {
     /// how to proceed (e.g. whether to abort migration or simply remember that this inode is
     /// invalid and tell the guest so).
     Invalid,
+
+    /// Described by its path: The destination will have to open the given filename relative to the
+    /// shared directory (the root node).  In contrast to `Path`, there is no strong reference to
+    /// the shared directory node.
+    FullPath {
+        /// Filename relative to the shared directory root node.  Stored in UTF-8, just like
+        /// `Path.filename`.
+        filename: String,
+    },
 }
 
 /// Serializable representation of an open file (a handle)

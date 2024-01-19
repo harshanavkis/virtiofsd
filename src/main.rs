@@ -920,6 +920,23 @@ struct Opt {
     /// This parameter is ignored on the destination side.
     #[arg(long = "migration-verify-handles")]
     migration_verify_handles: bool,
+
+    /// Double-check the identity of inodes right before switching over to the destination,
+    /// potentially making migration more resilient when third parties have write access to the
+    /// shared directory.
+    ///
+    /// When representing migrated inodes using their paths relative to the shared directory,
+    /// double-check during switch-over to the destination that each path still matches the
+    /// respective inode, and on mismatch, try to correct it via the respective symlink in
+    /// /proc/self/fd.
+    ///
+    /// Because this option requires accessing each inode indexed or opened by the guest, it can
+    /// prolong the switch-over phase of migration (when both source and destination are paused)
+    /// for an indeterminate amount of time.
+    ///
+    /// This parameter is ignored on the destination side.
+    #[arg(long = "migration-confirm-paths")]
+    migration_confirm_paths: bool,
 }
 
 fn parse_compat(opt: Opt) -> Opt {
@@ -1334,6 +1351,7 @@ fn main() {
         allow_mmap: opt.allow_mmap,
         migration_on_error: opt.migration_on_error,
         migration_verify_handles: opt.migration_verify_handles,
+        migration_confirm_paths: opt.migration_confirm_paths,
         ..Default::default()
     };
 

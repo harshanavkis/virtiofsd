@@ -202,6 +202,26 @@ impl serialized::Inode {
                 fs.inodes.new_inode(inode_data)?;
                 Ok(true)
             }
+
+            serialized::InodeLocation::FullPath { filename } => {
+                if self.id == fuse::ROOT_ID {
+                    return Err(other_io_error(
+                        "Refusing to use path given for root node".to_string(),
+                    ));
+                }
+
+                let Ok(shared_dir) = fs.inodes.get_strong(fuse::ROOT_ID) else {
+                    // No root node?  Defer until we have it.
+                    return Ok(false);
+                };
+
+                let inode_data = self
+                    .deserialize_path(fs, shared_dir, filename)
+                    .or_else(|err| self.deserialize_invalid_inode(fs, err))?;
+
+                fs.inodes.new_inode(inode_data)?;
+                Ok(true)
+            }
         }
     }
 

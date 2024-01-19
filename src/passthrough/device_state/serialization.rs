@@ -6,12 +6,18 @@
 /// information that we have collected during preserialization and turn it into actually
 /// serializable structs ('serialized' module), which are then turned into a plain vector of bytes.
 use crate::fuse;
-use crate::passthrough::device_state::preserialization::{self, HandleMigrationInfo};
+use crate::passthrough::device_state::preserialization::{
+    self, HandleMigrationInfo, InodeMigrationInfo,
+};
 use crate::passthrough::device_state::serialized;
+use crate::passthrough::file_handle::{FileHandle, SerializableFileHandle};
 use crate::passthrough::inode_store::InodeData;
-use crate::passthrough::{self, Handle, HandleData, PassthroughFs};
-use crate::util::other_io_error;
+use crate::passthrough::stat::statx;
+use crate::passthrough::util::relative_path;
+use crate::passthrough::{Handle, HandleData, PassthroughFs};
+use crate::util::{other_io_error, ResultErrorContext};
 use std::convert::TryFrom;
+use std::ffi::CString;
 use std::io;
 use std::sync::atomic::Ordering;
 
@@ -32,12 +38,12 @@ impl TryFrom<&PassthroughFs> for serialized::PassthroughFsV1 {
     fn try_from(fs: &PassthroughFs) -> io::Result<Self> {
         let handles_map = fs.handles.read().unwrap();
 
-        let inodes = fs
-            .inodes
-            .map(|inode| {
+        let inodes = if let Some(shared_dir) = fs.inodes.get(fuse::ROOT_ID) {
+            let shared_dir_path = shared_dir.get_path(&fs.proc_self_fd);
+            fs.inodes.map(|inode| {
                 inode
                     .as_ref()
-                    .as_serialized(&fs.cfg)
+                    .as_serialized(fs, &shared_dir, &shared_dir_path)
                     .unwrap_or_else(|err| {
                         warn!(
                             "Failed to serialize inode {} (st_dev={}, mnt_id={}, st_ino={}): {}; marking as invalid",
@@ -50,7 +56,17 @@ impl TryFrom<&PassthroughFs> for serialized::PassthroughFsV1 {
                             file_handle: None,
                         }
                     })
-            });
+            })
+        } else {
+            // When unmounted, we will not have a root node, that's OK.  But there should not be
+            // any other nodes either then.
+            if !fs.inodes.is_empty() {
+                return Err(other_io_error(
+                    "Root node (shared directory) not in inode store".to_string(),
+                ));
+            };
+            Vec::new()
+        };
 
         let handles = handles_map
             .iter()
@@ -83,7 +99,12 @@ impl From<&PassthroughFs> for serialized::NegotiatedOpts {
 
 impl InodeData {
     /// Serialize an inode, which requires that its `migration_info` is set
-    fn as_serialized(&self, fs_cfg: &passthrough::Config) -> io::Result<serialized::Inode> {
+    fn as_serialized(
+        &self,
+        fs: &PassthroughFs,
+        shared_dir: &InodeData,
+        shared_dir_path: &io::Result<CString>,
+    ) -> io::Result<serialized::Inode> {
         let id = self.inode;
         let refcount = self.refcount.load(Ordering::Relaxed);
 
@@ -108,9 +129,9 @@ impl InodeData {
         );
 
         // Serialize the information that tells the destination how to find this inode
-        let location = migration_info.location.as_serialized()?;
+        let location = migration_info.as_serialized(self, fs, shared_dir, shared_dir_path)?;
 
-        let file_handle = if fs_cfg.migration_verify_handles {
+        let file_handle = if fs.cfg.migration_verify_handles {
             // We could construct the file handle now, but we don't want to do I/O here.  It should
             // have been prepared in the preserialization phase.  If it is not, that's an internal
             // programming error.
@@ -132,14 +153,37 @@ impl InodeData {
     }
 }
 
-impl preserialization::InodeLocation {
+impl InodeMigrationInfo {
     /// Helper for serializing inodes: Turn their prepared `migration_info` into a
     /// `serialized::InodeLocation`
-    fn as_serialized(&self) -> io::Result<serialized::InodeLocation> {
-        Ok(match self {
+    fn as_serialized(
+        &self,
+        inode_data: &InodeData,
+        fs: &PassthroughFs,
+        shared_dir: &InodeData,
+        shared_dir_path: &io::Result<CString>,
+    ) -> io::Result<serialized::InodeLocation> {
+        Ok(match &self.location {
             preserialization::InodeLocation::RootNode => serialized::InodeLocation::RootNode,
 
             preserialization::InodeLocation::Path { parent, filename } => {
+                if fs.cfg.migration_confirm_paths {
+                    if let Err(err) = self.check_presence(inode_data, parent.get(), filename) {
+                        warn!(
+                            "Lost inode {} (former location: {}): {}; looking it up through /proc/self/fd",
+                            inode_data.inode, filename, err
+                        );
+                        // Inode is gone (or replaced), look for it in /proc/self/fd
+                        let path_in_shared_dir = self
+                            .path_from_proc_self_fd(inode_data, fs, shared_dir, shared_dir_path)
+                            .err_context(|| "Failed to get path from /proc/self/fd".to_string())?;
+                        info!("Found inode {}: {}", inode_data.inode, path_in_shared_dir);
+                        return Ok(serialized::InodeLocation::FullPath {
+                            filename: path_in_shared_dir,
+                        });
+                    }
+                }
+
                 // Safe: We serialize everything before we will drop the serialized state (the
                 // inode store), so the strong refcount in there will outlive this weak reference
                 // (which means that the ID we get will remain valid until everything is
@@ -150,6 +194,94 @@ impl preserialization::InodeLocation {
                 serialized::InodeLocation::Path { parent, filename }
             }
         })
+    }
+
+    /// Check whether the given `inode_data` from our inode store can be found at the given location
+    /// (i.e. `filename` under parent directory `parent`)
+    fn check_presence(
+        &self,
+        inode_data: &InodeData,
+        parent: &InodeData,
+        filename: &str,
+    ) -> io::Result<()> {
+        let filename = CString::new(filename)?;
+        let parent_fd = parent.get_file()?;
+        let st = statx(&parent_fd, Some(&filename))?;
+
+        if st.st.st_dev != inode_data.ids.dev {
+            return Err(other_io_error(format!(
+                "Device ID differs: Expected {}, found {}",
+                inode_data.ids.dev, st.st.st_dev
+            )));
+        }
+
+        // Try to take a file handle from `self.file_handle`; if none is there, try to generate it
+        // (but ignore errors, falling back to checking the inode ID).  We do really want to check
+        // the file handle if possible, though, to detect inode ID reuse.
+        let (fh, fh_ref) = if let Some(fh_ref) = self.file_handle.as_ref() {
+            (None, Some(fh_ref))
+        } else if let Ok(fh) = SerializableFileHandle::try_from(&inode_data.file_or_handle) {
+            (Some(fh), None)
+        } else {
+            (None, None)
+        };
+        if let Some(fh) = fh_ref.or(fh.as_ref()) {
+            // If we got a file handle for `inode_data`, failing to get it for `filename` probably
+            // means it is a different inode.  Be cautious and return an error then.
+            let actual_fh = FileHandle::from_name_at_fail_hard(&parent_fd, &filename)
+                .err_context(|| "Failed to generate file handle")?;
+            // Ignore mount ID: A file handle can be in two different mount IDs, but as long as it
+            // is on the same device, it is still the same mount ID; and we have already checked
+            // the device ID.
+            fh.require_equal_without_mount_id(&actual_fh.into())
+                .map_err(other_io_error)
+        } else {
+            // Cannot generate file handle?  Fall back to just the inode ID.
+            if st.st.st_ino != inode_data.ids.ino {
+                return Err(other_io_error(format!(
+                    "Inode ID differs: Expected {}, found {}",
+                    inode_data.ids.ino, st.st.st_ino
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    /// Retrieve the inode's path relative to the shared directory from /proc/self/fd
+    fn path_from_proc_self_fd(
+        &self,
+        inode_data: &InodeData,
+        fs: &PassthroughFs,
+        shared_dir: &InodeData,
+        shared_dir_path: &io::Result<CString>,
+    ) -> io::Result<String> {
+        let path = inode_data.get_path(&fs.proc_self_fd)?;
+
+        // Kernel will report nodes beyond our root as having path / -- but only the root node (the
+        // shared directory) can actually have that path, so we can cut the rest short and spare
+        // the user the more cryptic error generated by `check_presence()`
+        if path.as_bytes() == b"/" && inode_data.inode != fuse::ROOT_ID {
+            return Err(other_io_error(
+                "Got empty path for non-root node, so it is outside the shared directory"
+                    .to_string(),
+            ));
+        }
+
+        let shared_dir_path = shared_dir_path.as_ref().map_err(|err| {
+            io::Error::new(err.kind(), format!("Shared directory path unknown: {err}"))
+        })?;
+
+        let relative_path = relative_path(&path, shared_dir_path)?
+            .to_str()
+            .map_err(|err| other_io_error(format!("Path {path:?} is not a UTF-8 string: {err}")))?
+            .to_string();
+
+        self.check_presence(inode_data, shared_dir, &relative_path)
+            .map_err(|err| {
+                io::Error::new(err.kind(), format!("Inode not found at {path:?}: {err}"))
+            })?;
+
+        Ok(relative_path)
     }
 }
 

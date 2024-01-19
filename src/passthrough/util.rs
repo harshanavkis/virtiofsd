@@ -111,3 +111,23 @@ pub fn printable_fd(fd: &impl AsRawFd, proc_self_fd: Option<&impl AsRawFd>) -> S
         format!("{{fd:{}}}", fd.as_raw_fd())
     }
 }
+
+pub fn relative_path<'a>(path: &'a CStr, prefix: &CStr) -> io::Result<&'a CStr> {
+    let mut relative_path = path
+        .to_bytes_with_nul()
+        .strip_prefix(prefix.to_bytes())
+        .ok_or_else(|| {
+            other_io_error(format!(
+                "Path {path:?} is outside the directory ({prefix:?})"
+            ))
+        })?;
+
+    // Remove leading / if left
+    while let Some(prefixless) = relative_path.strip_prefix(b"/") {
+        relative_path = prefixless;
+    }
+
+    // Must succeed: Was a `CStr` before, converted to `&[u8]` via `to_bytes_with_nul()`, so must
+    // still contain exactly one NUL byte at the end of the slice
+    Ok(CStr::from_bytes_with_nul(relative_path).unwrap())
+}

@@ -248,6 +248,10 @@ impl InodeStoreInner {
         self.by_handle.get(handle).copied()
     }
 
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     /// Decrement the refcount of the given `inode` ID, and remove it from the store when it
     /// reaches 0
     fn forget_one(&mut self, inode: Inode, count: u64) {
@@ -440,6 +444,10 @@ impl InodeStore {
 
     pub fn clear_migration_info(&self) {
         self.inner.write().unwrap().clear_migration_info();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.read().unwrap().is_empty()
     }
 }
 

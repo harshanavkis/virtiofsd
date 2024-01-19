@@ -322,6 +322,13 @@ pub struct Config {
     ///
     /// The default is `false`.
     pub migration_verify_handles: bool,
+
+    /// Whether to confirm (for path-based migration) at serialization (during switch-over) whether
+    /// the paths still match the inodes they are supposed to represent, and if they do not, try to
+    /// correct the path via the respective symlink in /proc/self/fd.
+    ///
+    /// The default is `false`.
+    pub migration_confirm_paths: bool,
 }
 
 impl Default for Config {
@@ -349,6 +356,7 @@ impl Default for Config {
             allow_mmap: false,
             migration_on_error: MigrationOnError::Abort,
             migration_verify_handles: false,
+            migration_confirm_paths: false,
         }
     }
 }
