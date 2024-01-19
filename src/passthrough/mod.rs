@@ -44,9 +44,17 @@ const EMPTY_CSTR: &[u8] = b"\0";
 
 type Handle = u64;
 
+enum HandleDataFile {
+    File(RwLock<File>),
+    #[allow(dead_code)] // will be constructed once deserialization is implemented
+    // `io::Error` does not implement `Clone`, so without wrapping it in `Arc`, returning the error
+    // anywhere would be impossible without consuming it
+    Invalid(Arc<io::Error>),
+}
+
 struct HandleData {
     inode: Inode,
-    file: RwLock<File>,
+    file: HandleDataFile,
 }
 
 struct ScopedWorkingDirectory {
@@ -762,22 +770,24 @@ impl PassthroughFs {
             flags &= !(libc::O_NOATIME as u32)
         }
 
-        let file = RwLock::new({
+        let file = {
             let _killpriv_guard = if self.cfg.killpriv_v2 && kill_priv {
                 drop_effective_cap("FSETID")?
             } else {
                 None
             };
             self.open_inode(inode, flags as i32)?
-        });
+        };
 
         if flags & (libc::O_TRUNC as u32) != 0 {
-            let file = file.read().expect("poisoned lock");
             self.clear_file_capabilities(file.as_raw_fd(), false)?;
         }
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let data = HandleData { inode, file };
+        let data = HandleData {
+            inode,
+            file: file.into(),
+        };
 
         self.handles.write().unwrap().insert(handle, Arc::new(data));
 
@@ -1274,7 +1284,7 @@ impl FileSystem for PassthroughFs {
         // lock for both the `lseek64` and `getdents64` syscalls to ensure that no other
         // thread changes the kernel offset while we are using it.
         #[allow(clippy::readonly_write_lock)]
-        let dir = data.file.write().unwrap();
+        let dir = data.file.get()?.write().unwrap();
 
         ReadDir::new(&*dir, offset as libc::off64_t, buf)
     }
@@ -1350,14 +1360,14 @@ impl FileSystem for PassthroughFs {
             }
             Ok(fd) => {
                 // Safe because we just opened this fd.
-                let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
+                let file = unsafe { File::from_raw_fd(fd) };
 
                 let entry = self.do_lookup(parent, name)?;
 
                 let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
                 let data = HandleData {
                     inode: entry.inode,
-                    file,
+                    file: file.into(),
                 };
 
                 self.handles.write().unwrap().insert(handle, Arc::new(data));
@@ -1431,7 +1441,7 @@ impl FileSystem for PassthroughFs {
 
         // This is safe because write_from uses preadv64, so the underlying file descriptor
         // offset is not affected by this operation.
-        let f = data.file.read().unwrap();
+        let f = data.file.get()?.read().unwrap();
         w.write_from(&f, size as usize, offset)
     }
 
@@ -1452,7 +1462,7 @@ impl FileSystem for PassthroughFs {
 
         // This is safe because read_to uses `pwritev2(2)`, so the underlying file descriptor
         // offset is not affected by this operation.
-        let f = data.file.read().unwrap();
+        let f = data.file.get()?.read().unwrap();
 
         {
             let _killpriv_guard = if self.cfg.killpriv_v2 && kill_priv {
@@ -1516,7 +1526,7 @@ impl FileSystem for PassthroughFs {
         let data = if let Some(handle) = handle {
             let hd = self.find_handle(handle, inode)?;
 
-            let fd = hd.file.write().unwrap().as_raw_fd();
+            let fd = hd.file.get()?.write().unwrap().as_raw_fd();
             Data::Handle(hd, fd)
         } else {
             let pathname = CString::new(format!("{}", inode_file.as_raw_fd()))
@@ -1839,7 +1849,7 @@ impl FileSystem for PassthroughFs {
         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
         // because this doesn't modify any memory and we check the return values.
         unsafe {
-            let newfd = libc::dup(data.file.write().unwrap().as_raw_fd());
+            let newfd = libc::dup(data.file.get()?.write().unwrap().as_raw_fd());
             if newfd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -1855,7 +1865,7 @@ impl FileSystem for PassthroughFs {
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
         let data = self.find_handle(handle, inode)?;
 
-        let fd = data.file.write().unwrap().as_raw_fd();
+        let fd = data.file.get()?.write().unwrap().as_raw_fd();
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
@@ -2188,7 +2198,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<()> {
         let data = self.find_handle(handle, inode)?;
 
-        let fd = data.file.write().unwrap().as_raw_fd();
+        let fd = data.file.get()?.write().unwrap().as_raw_fd();
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
             libc::fallocate64(
@@ -2215,7 +2225,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<u64> {
         let data = self.find_handle(handle, inode)?;
 
-        let fd = data.file.write().unwrap().as_raw_fd();
+        let fd = data.file.get()?.write().unwrap().as_raw_fd();
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::lseek(fd, offset as libc::off64_t, whence as libc::c_int) };
@@ -2241,12 +2251,12 @@ impl FileSystem for PassthroughFs {
         let data_in = self.find_handle(handle_in, inode_in)?;
 
         // Take just a read lock as we're not going to alter the file descriptor offset.
-        let fd_in = data_in.file.read().unwrap().as_raw_fd();
+        let fd_in = data_in.file.get()?.read().unwrap().as_raw_fd();
 
         let data_out = self.find_handle(handle_out, inode_out)?;
 
         // Take just a read lock as we're not going to alter the file descriptor offset.
-        let fd_out = data_out.file.read().unwrap().as_raw_fd();
+        let fd_out = data_out.file.get()?.read().unwrap().as_raw_fd();
 
         // Safe because this will only modify `offset_in` and `offset_out` and we check
         // the return value.
@@ -2281,5 +2291,20 @@ impl FileSystem for PassthroughFs {
         } else {
             Ok(())
         }
+    }
+}
+
+impl HandleDataFile {
+    fn get(&self) -> io::Result<&'_ RwLock<File>> {
+        match self {
+            HandleDataFile::File(file) => Ok(file),
+            HandleDataFile::Invalid(err) => Err(io::Error::new(err.kind(), Arc::clone(err))),
+        }
+    }
+}
+
+impl From<File> for HandleDataFile {
+    fn from(file: File) -> Self {
+        HandleDataFile::File(RwLock::new(file))
     }
 }

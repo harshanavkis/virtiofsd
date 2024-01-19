@@ -27,6 +27,9 @@ pub struct OpenableFileHandle {
 pub enum FileOrHandle {
     File(File),
     Handle(OpenableFileHandle),
+    // `io::Error` does not implement `Clone`, so without wrapping it in `Arc`, returning the error
+    // anywhere would be impossible without consuming it
+    Invalid(Arc<io::Error>),
 }
 
 impl FileHandle {

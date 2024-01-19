@@ -83,6 +83,7 @@ impl<'a> InodeData {
                 let file = h.open(libc::O_PATH)?;
                 Ok(InodeFile::Owned(file))
             }
+            FileOrHandle::Invalid(err) => Err(io::Error::new(err.kind(), Arc::clone(err))),
         }
     }
 
@@ -93,19 +94,24 @@ impl<'a> InodeData {
         flags: libc::c_int,
         proc_self_fd: &File,
     ) -> io::Result<InodeFile<'static>> {
-        if !is_safe_inode(self.mode) {
-            return Err(ebadf());
-        }
-
+        // Do not move the `is_safe_inode()` check up: It is always false for invalid inodes, so
+        // would hide their perfectly good error message
         match &self.file_or_handle {
             FileOrHandle::File(f) => {
+                if !is_safe_inode(self.mode) {
+                    return Err(ebadf());
+                }
                 let new_file = reopen_fd_through_proc(f, flags, proc_self_fd)?;
                 Ok(InodeFile::Owned(new_file))
             }
             FileOrHandle::Handle(h) => {
+                if !is_safe_inode(self.mode) {
+                    return Err(ebadf());
+                }
                 let new_file = h.open(flags)?;
                 Ok(InodeFile::Owned(new_file))
             }
+            FileOrHandle::Invalid(err) => Err(io::Error::new(err.kind(), Arc::clone(err))),
         }
     }
 }
@@ -302,6 +308,7 @@ impl InodeStore {
         let handle = match &inode_data.file_or_handle {
             FileOrHandle::File(_) => None,
             FileOrHandle::Handle(handle) => Some(handle.inner()),
+            FileOrHandle::Invalid(_) => None,
         };
         if let Ok(inode) = self.do_claim_inode(&inner, handle, &inode_data.ids) {
             return Ok(inode);
