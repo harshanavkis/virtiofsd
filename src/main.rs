@@ -36,7 +36,7 @@ use virtiofsd::passthrough::{self, CachePolicy, InodeFileHandlesMode, Passthroug
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
 use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
 use virtiofsd::server::Server;
-use virtiofsd::util::write_pid_file;
+use virtiofsd::util::{other_io_error, write_pid_file};
 use virtiofsd::{limits, oslib, Error as VhostUserFsError};
 use vm_memory::{
     ByteValued, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap, Le32,
@@ -119,7 +119,7 @@ impl error::Error for Error {}
 
 impl convert::From<Error> for io::Error {
     fn from(e: Error) -> Self {
-        io::Error::new(io::ErrorKind::Other, e)
+        other_io_error(e)
     }
 }
 
