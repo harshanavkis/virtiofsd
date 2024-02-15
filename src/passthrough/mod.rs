@@ -138,6 +138,32 @@ pub enum InodeFileHandlesMode {
     Mandatory,
 }
 
+/// What to do when an error occurs during migration (checked on the migration destination)
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MigrationOnError {
+    /// Whenever any failure occurs, return a hard error to the vhost-user front-end (e.g.  QEMU),
+    /// aborting migration.
+    #[default]
+    Abort,
+
+    /// Let migration finish, but the guest will be unable to access any of the files that were
+    /// failed to be found/opened, receiving only errors.
+    GuestError,
+}
+
+impl FromStr for MigrationOnError {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "abort" => Ok(MigrationOnError::Abort),
+            "guest-error" => Ok(MigrationOnError::GuestError),
+
+            _ => Err("invalid migration-on-error value"),
+        }
+    }
+}
+
 /// Options that configure the behavior of the file system.
 #[derive(Debug)]
 pub struct Config {
@@ -279,6 +305,11 @@ pub struct Config {
     ///
     /// The default is `false`.
     pub allow_mmap: bool,
+
+    /// Defines what happens when restoring our internal state on the destination fails.
+    ///
+    /// The default is `Abort`.
+    pub migration_on_error: MigrationOnError,
 }
 
 impl Default for Config {
@@ -304,6 +335,7 @@ impl Default for Config {
             security_label: false,
             clean_noatime: true,
             allow_mmap: false,
+            migration_on_error: MigrationOnError::Abort,
         }
     }
 }

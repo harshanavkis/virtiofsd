@@ -35,7 +35,9 @@ use virtio_bindings::bindings::virtio_ring::{
 use virtio_queue::{DescriptorChain, QueueOwnedT};
 use virtiofsd::descriptor_utils::{Error as VufDescriptorError, Reader, Writer};
 use virtiofsd::filesystem::{FileSystem, SerializableFileSystem};
-use virtiofsd::passthrough::{self, CachePolicy, InodeFileHandlesMode, PassthroughFs};
+use virtiofsd::passthrough::{
+    self, CachePolicy, InodeFileHandlesMode, MigrationOnError, PassthroughFs,
+};
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
 use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
 use virtiofsd::server::Server;
@@ -882,6 +884,22 @@ struct Opt {
     /// without having ownership/capability to use O_NOATIME).
     #[arg(long = "preserve-noatime")]
     preserve_noatime: bool,
+
+    /// Controls how to respond to errors during migration.
+    ///
+    /// If any inode turns out not to be migrateable (either the source cannot serialize it, or the
+    /// destination cannot opened the serialized representation), the destination can react in
+    /// different ways:
+    ///
+    /// - abort: Whenever any error occurs, return a hard error to the vhost-user front-end (e.g.
+    ///          QEMU), aborting migration.
+    ///
+    /// - guest-error: Let migration finish, but the guest will be unable to access any of the
+    ///                affected inodes, receiving only errors.
+    ///
+    /// This parameter is ignored on the source side.
+    #[arg(long = "migration-on-error", default_value = "abort")]
+    migration_on_error: MigrationOnError,
 }
 
 fn parse_compat(opt: Opt) -> Opt {
@@ -1294,6 +1312,7 @@ fn main() {
         posix_acl: opt.posix_acl,
         clean_noatime: !opt.preserve_noatime && !has_noatime_capability(),
         allow_mmap: opt.allow_mmap,
+        migration_on_error: opt.migration_on_error,
         ..Default::default()
     };
 
