@@ -169,6 +169,27 @@ impl FromStr for MigrationOnError {
     }
 }
 
+/// How to migrate our internal state to the destination instance
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MigrationMode {
+    /// Iterate through the shared directory to find paths for all inodes indexed and opened by the
+    /// guest, and transfer these paths to the destination.
+    #[default]
+    FindPaths,
+}
+
+impl FromStr for MigrationMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "find-paths" => Ok(MigrationMode::FindPaths),
+
+            _ => Err("invalid migration-mode value"),
+        }
+    }
+}
+
 /// Options that configure the behavior of the file system.
 #[derive(Debug)]
 pub struct Config {
@@ -329,6 +350,11 @@ pub struct Config {
     ///
     /// The default is `false`.
     pub migration_confirm_paths: bool,
+
+    /// Defines how to migrate our internal state to the destination instance.
+    ///
+    /// The default is `FindPaths`.
+    pub migration_mode: MigrationMode,
 }
 
 impl Default for Config {
@@ -357,6 +383,7 @@ impl Default for Config {
             migration_on_error: MigrationOnError::Abort,
             migration_verify_handles: false,
             migration_confirm_paths: false,
+            migration_mode: MigrationMode::FindPaths,
         }
     }
 }

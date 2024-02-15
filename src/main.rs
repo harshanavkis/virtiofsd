@@ -36,7 +36,7 @@ use virtio_queue::{DescriptorChain, QueueOwnedT};
 use virtiofsd::descriptor_utils::{Error as VufDescriptorError, Reader, Writer};
 use virtiofsd::filesystem::{FileSystem, SerializableFileSystem};
 use virtiofsd::passthrough::{
-    self, CachePolicy, InodeFileHandlesMode, MigrationOnError, PassthroughFs,
+    self, CachePolicy, InodeFileHandlesMode, MigrationMode, MigrationOnError, PassthroughFs,
 };
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
 use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
@@ -885,6 +885,16 @@ struct Opt {
     #[arg(long = "preserve-noatime")]
     preserve_noatime: bool,
 
+    /// Defines how to perform migration, i.e. how to represent the internal state to the
+    /// destination, and how to obtain that representation.
+    ///
+    /// - find-paths: Iterate through the shared directory (exhaustive search) to find paths for
+    ///   all inodes indexed and opened by the guest, and transfer these paths to the destination.
+    ///
+    /// This parameter is ignored on the destination side.
+    #[arg(long = "migration-mode", default_value = "find-paths")]
+    migration_mode: MigrationMode,
+
     /// Controls how to respond to errors during migration.
     ///
     /// If any inode turns out not to be migrateable (either the source cannot serialize it, or the
@@ -1352,6 +1362,7 @@ fn main() {
         migration_on_error: opt.migration_on_error,
         migration_verify_handles: opt.migration_verify_handles,
         migration_confirm_paths: opt.migration_confirm_paths,
+        migration_mode: opt.migration_mode,
         ..Default::default()
     };
 
