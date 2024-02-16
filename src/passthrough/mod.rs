@@ -310,6 +310,13 @@ pub struct Config {
     ///
     /// The default is `Abort`.
     pub migration_on_error: MigrationOnError,
+
+    /// Whether to store a file handle for each inode in the migration stream, alongside the
+    /// information on how to find the inode.  The destination must generate the file handle for
+    /// the inode it has opened and verify they match.
+    ///
+    /// The default is `false`.
+    pub migration_verify_handles: bool,
 }
 
 impl Default for Config {
@@ -336,6 +343,7 @@ impl Default for Config {
             clean_noatime: true,
             allow_mmap: false,
             migration_on_error: MigrationOnError::Abort,
+            migration_verify_handles: false,
         }
     }
 }

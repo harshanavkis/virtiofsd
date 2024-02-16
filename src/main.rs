@@ -900,6 +900,26 @@ struct Opt {
     /// This parameter is ignored on the source side.
     #[arg(long = "migration-on-error", default_value = "abort")]
     migration_on_error: MigrationOnError,
+
+    /// Ensure that the migration destination opens the very same inodes as the source (only works
+    /// if source and destination use the same shared directory on the same filesystem).
+    ///
+    /// This option makes the source attach the respective file handle to each inode transferred
+    /// during migration.  Once the destination has (re-)opened the inode, it will generate the
+    /// file handle on its end, and compare, ensuring that it has opened the very same inode.
+    ///
+    /// (File handles are per-filesystem unique identifiers for inodes that, besides the inode ID,
+    /// also include a generation ID to protect against inode ID reuse.)
+    ///
+    /// Using this option protects against external parties renaming or replacing inodes
+    /// while migration is ongoing, which, without this option, can lead to data loss or
+    /// corruption, so it should always be used when other processes besides virtiofsd have write
+    /// access to the shared directory.  However, again, it only works if both source and
+    /// destination use the same shared directory.
+    ///
+    /// This parameter is ignored on the destination side.
+    #[arg(long = "migration-verify-handles")]
+    migration_verify_handles: bool,
 }
 
 fn parse_compat(opt: Opt) -> Opt {
@@ -1313,6 +1333,7 @@ fn main() {
         clean_noatime: !opt.preserve_noatime && !has_noatime_capability(),
         allow_mmap: opt.allow_mmap,
         migration_on_error: opt.migration_on_error,
+        migration_verify_handles: opt.migration_verify_handles,
         ..Default::default()
     };
 
