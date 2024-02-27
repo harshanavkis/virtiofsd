@@ -686,7 +686,10 @@ impl PassthroughFs {
         };
 
         Ok(Entry {
-            inode,
+            // By leaking, we transfer ownership of this refcount to the guest.  That is safe,
+            // because the guest is expected to explicitly release its reference and decrement the
+            // refcount via `FORGET` later.
+            inode: unsafe { inode.leak() },
             generation: 0,
             attr: st.st,
             attr_flags,

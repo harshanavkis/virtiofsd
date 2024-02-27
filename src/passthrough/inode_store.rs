@@ -22,6 +22,21 @@ pub struct InodeIds {
     pub mnt_id: MountId,
 }
 
+/// Strong reference to some inode in our inode store, which is counted against the
+/// `InodeData.refcount` field.  Dropping this object will thus decrement that refcount, and
+/// potentially remove the inode from the store (when the refcount reaches 0).
+/// Note that dropping this object locks its inode store, so care must be taken not to drop strong
+/// references while the inode store is locked, or to use `StrongInodeReference::drop_unlocked()`.
+pub struct StrongInodeReference {
+    /// Referenced inode's data.
+    /// Is only `None` after the inode has been leaked, which cannot occur outside of `leak()` and
+    /// `drop()`, because `leak()` consumes the object.
+    inode_data: Option<Arc<InodeData>>,
+
+    /// Inode store that holds the referenced inode.
+    inode_store: Arc<RwLock<InodeStoreInner>>,
+}
+
 pub struct InodeData {
     pub inode: Inode,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
@@ -226,11 +241,22 @@ impl InodeStore {
         self.inner.read().unwrap().inode_by_handle(handle)
     }
 
+    /// Turn the weak reference `inode` into a strong one (increments its refcount)
+    pub fn get_strong(&self, inode: Inode) -> io::Result<StrongInodeReference> {
+        StrongInodeReference::new(inode, self)
+    }
+
     /// Attempt to get an inode from `inodes` and create a strong reference to it, i.e. increment
     /// its refcount.  Return that reference on success, and an error on failure.
     /// Reasons for failure can be that the inode isn't in the map or that the refcount is zero.
     /// This function will never increment a refcount that's already zero.
-    pub fn claim_inode(&self, handle: Option<&FileHandle>, ids: &InodeIds) -> io::Result<Inode> {
+    /// Note that dropping the returned strong reference will automatically decrement the refcount
+    /// again.
+    pub fn claim_inode(
+        &self,
+        handle: Option<&FileHandle>,
+        ids: &InodeIds,
+    ) -> io::Result<StrongInodeReference> {
         self.do_claim_inode(&self.inner.read().unwrap(), handle, ids)
     }
 
@@ -239,7 +265,7 @@ impl InodeStore {
         inner: &I,
         handle: Option<&FileHandle>,
         ids: &InodeIds,
-    ) -> io::Result<Inode> {
+    ) -> io::Result<StrongInodeReference> {
         let data = handle
             .and_then(|h| inner.get_by_handle(h))
             .or_else(|| {
@@ -263,7 +289,7 @@ impl InodeStore {
                 )
             })?;
 
-        Ok(data.inode)
+        StrongInodeReference::new_with_data(Arc::clone(data), self)
     }
 
     /// Check whether a matching inode is already present (see `claim_inode`), and if so, return
@@ -271,7 +297,7 @@ impl InodeStore {
     /// Otherwise, insert `inode_data`, and return a strong reference to it.  `inode_data.refcount`
     /// is ignored; the returned strong reference is the only one that can exist, so the refcount
     /// is hard-set to 1.
-    pub fn get_or_insert(&self, mut inode_data: InodeData) -> io::Result<Inode> {
+    pub fn get_or_insert(&self, mut inode_data: InodeData) -> io::Result<StrongInodeReference> {
         let mut inner = self.inner.write().unwrap();
         let handle = match &inode_data.file_or_handle {
             FileOrHandle::File(_) => None,
@@ -289,10 +315,11 @@ impl InodeStore {
 
         // Safe because we have the only reference
         inode_data.refcount = AtomicU64::new(1);
-        let inode = inode_data.inode;
-        inner.insert(Arc::new(inode_data));
+        let inode_data = Arc::new(inode_data);
+        inner.insert(Arc::clone(&inode_data));
 
-        Ok(inode)
+        // We just set the reference to 1 to account for this
+        Ok(unsafe { StrongInodeReference::new_no_increment(inode_data, self) })
     }
 
     /// Insert `inode_data` into the inode store regardless of whether a matching inode already
@@ -327,5 +354,135 @@ impl InodeStore {
 
     pub fn clear(&self) {
         self.inner.write().unwrap().clear();
+    }
+}
+
+impl StrongInodeReference {
+    /// Create a new strong reference to the given inode in the given inode store, incrementing the
+    /// refcount appropriately.
+    pub fn new(inode: Inode, inode_store: &InodeStore) -> io::Result<Self> {
+        let inode_data = inode_store.get(inode).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Cannot take strong reference to inode {inode}: Not found"),
+            )
+        })?;
+
+        Self::new_with_data(inode_data, inode_store)
+    }
+
+    /// Create a new strong reference to an inode with the given data from the given inode store,
+    /// incrementing the refcount appropriately.
+    pub fn new_with_data(inode_data: Arc<InodeData>, inode_store: &InodeStore) -> io::Result<Self> {
+        Self::increment_refcount_for(&inode_data)?;
+
+        // Safe because we have just incremented the refcount
+        Ok(unsafe { StrongInodeReference::new_no_increment(inode_data, inode_store) })
+    }
+
+    /// Create a new strong reference to an inode with the given data from the given inode store,
+    /// but do not increment the inode's refcount, and instead assume that the caller has already
+    /// done it.
+    ///
+    /// # Safety
+    /// Caller ensures the inode's refcount is incremented by 1 to account for this strong
+    /// reference.
+    pub unsafe fn new_no_increment(inode_data: Arc<InodeData>, inode_store: &InodeStore) -> Self {
+        StrongInodeReference {
+            inode_data: Some(inode_data),
+            inode_store: Arc::clone(&inode_store.inner),
+        }
+    }
+
+    /// Tries to increment the refcount in the given `inode_data`, but will refuse to increment a
+    /// refcount that is 0 (because in this case, the inode is already in the process of being
+    /// removed from the store, so continuing to use it would not be safe).
+    fn increment_refcount_for(inode_data: &InodeData) -> io::Result<()> {
+        // Use `.fetch_update()` instead of `.fetch_add()` to ensure we never increment the
+        // refcount from zero to one.
+        match inode_data
+            .refcount
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |rc| {
+                (rc > 0).then_some(rc + 1)
+            }) {
+            Ok(_old_rc) => Ok(()),
+            Err(_old_rc) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "Cannot take strong reference to inode {}: Is already deleted",
+                    inode_data.inode
+                ),
+            )),
+        }
+    }
+
+    /// Consume this strong reference, yield the underlying inode ID, without decrementing the
+    /// inode's refcount.
+    ///
+    /// # Safety
+    /// Caller must guarantee that the refcount is tracked somehow still, i.e. that forget_one()
+    /// will eventually be called.  Otherwise, this inode will be truly leaked, which generally is
+    /// not good.
+    pub unsafe fn leak(mut self) -> Inode {
+        // Unwrapping is safe: Every initializer sets this to `Some(_)`, and every function that
+        // `take()`s the value (`leak()`, `drop_unlocked()`, `drop()`) also consumes `self`, so
+        // outside of them, this must always be `None`.
+        self.inode_data.take().unwrap().inode
+    }
+
+    /// Yield the underlying inode ID.
+    ///
+    /// # Safety
+    /// The inode ID is technically a form of a weak reference.  To ensure safety, the caller may
+    /// not assume that it is valid beyond the lifetime of the corresponding strong reference.
+    pub unsafe fn get_raw(&self) -> Inode {
+        // Unwrapping is safe: Every initializer sets this to `Some(_)`, and every function that
+        // `take()`s the value (`leak()`, `drop_unlocked()`, `drop()`) also consumes `self`, so
+        // outside of them, this must always be `None`.
+        self.inode_data.as_ref().unwrap().inode
+    }
+
+    /// Get the associated inode data.
+    pub fn get(&self) -> &InodeData {
+        // Unwrapping is safe: Every initializer sets this to `Some(_)`, and every function that
+        // `take()`s the value (`leak()`, `drop_unlocked()`, `drop()`) also consumes `self`, so
+        // outside of them, this must always be `None`.
+        self.inode_data.as_ref().unwrap()
+    }
+}
+
+impl Clone for StrongInodeReference {
+    /// Create an additional strong reference.
+    fn clone(&self) -> Self {
+        // Unwrapping is safe: Every initializer sets this to `Some(_)`, and every function that
+        // `take()`s the value (`leak()`, `drop_unlocked()`, `drop()`) also consumes `self`, so
+        // outside of them, this must always be `None`.
+        let cloned_data = Arc::clone(self.inode_data.as_ref().unwrap());
+        let cloned_store = Arc::clone(&self.inode_store);
+
+        // Unwrapping is safe, because this can only fail if the refcount became 0, which is
+        // impossible because `self` is a strong reference
+        Self::increment_refcount_for(&cloned_data).unwrap();
+
+        StrongInodeReference {
+            inode_data: Some(cloned_data),
+            inode_store: cloned_store,
+        }
+    }
+}
+
+impl Drop for StrongInodeReference {
+    /// Decrement the refcount on the referenced inode, removing it from the store when the
+    /// refcount reaches 0.
+    /// Note that this function locks `self.inode_store`, so a `StrongInodeReference` must not be
+    /// dropped while that inode store is locked.  In such a case,
+    /// `StrongInodeReference::drop_unlocked()` must be used.
+    fn drop(&mut self) {
+        if let Some(inode_data) = self.inode_data.take() {
+            self.inode_store
+                .write()
+                .unwrap()
+                .forget_one(inode_data.inode, 1);
+        }
     }
 }
