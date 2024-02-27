@@ -453,7 +453,7 @@ impl PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&inode)
+            .get(inode)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -643,7 +643,7 @@ impl PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&parent)
+            .get(parent)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -849,7 +849,7 @@ impl PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&inode)
+            .get(inode)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -864,7 +864,7 @@ impl PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&parent)
+            .get(parent)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -1088,7 +1088,7 @@ impl PassthroughFs {
 }
 
 fn forget_one(inodes: &mut InodeStore, inode: Inode, count: u64) {
-    if let Some(data) = inodes.get(&inode) {
+    if let Some(data) = inodes.get(inode) {
         // Acquiring the write lock on the inode map prevents new lookups from incrementing the
         // refcount but there is the possibility that a previous lookup already acquired a
         // reference to the inode data and is in the process of updating the refcount so we need
@@ -1116,7 +1116,7 @@ fn forget_one(inodes: &mut InodeStore, inode: Inode, count: u64) {
                     // thread that is waiting to do a forget on the same inode will have to wait
                     // until we release the lock. So there's is no other release store for us to
                     // synchronize with before deleting the entry.
-                    inodes.remove(&inode);
+                    inodes.remove(inode);
                 }
                 break;
             }
@@ -1235,7 +1235,7 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&inode)
+            .get(inode)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -1302,7 +1302,7 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&parent)
+            .get(parent)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -1406,7 +1406,7 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&parent)
+            .get(parent)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -1595,7 +1595,7 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&inode)
+            .get(inode)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -1755,14 +1755,14 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&olddir)
+            .get(olddir)
             .cloned()
             .ok_or_else(ebadf)?;
         let new_inode = self
             .inodes
             .read()
             .unwrap()
-            .get(&newdir)
+            .get(newdir)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -1803,7 +1803,7 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&parent)
+            .get(parent)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -1859,14 +1859,14 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&inode)
+            .get(inode)
             .cloned()
             .ok_or_else(ebadf)?;
         let new_inode = self
             .inodes
             .read()
             .unwrap()
-            .get(&newparent)
+            .get(newparent)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -1905,7 +1905,7 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&parent)
+            .get(parent)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -1945,7 +1945,7 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&inode)
+            .get(inode)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -2035,7 +2035,7 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&inode)
+            .get(inode)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -2097,7 +2097,7 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&inode)
+            .get(inode)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -2208,7 +2208,7 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&inode)
+            .get(inode)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -2266,7 +2266,7 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&inode)
+            .get(inode)
             .cloned()
             .ok_or_else(ebadf)?;
 
@@ -2325,7 +2325,7 @@ impl FileSystem for PassthroughFs {
             .inodes
             .read()
             .unwrap()
-            .get(&inode)
+            .get(inode)
             .cloned()
             .ok_or_else(ebadf)?;
 

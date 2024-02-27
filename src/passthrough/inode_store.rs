@@ -118,8 +118,8 @@ impl InodeStore {
         self.data.insert(data.inode, data);
     }
 
-    pub fn remove(&mut self, inode: &Inode) -> Option<Arc<InodeData>> {
-        let data = self.data.remove(inode);
+    pub fn remove(&mut self, inode: Inode) -> Option<Arc<InodeData>> {
+        let data = self.data.remove(&inode);
         if let Some(data) = data.as_ref() {
             if let FileOrHandle::Handle(handle) = &data.file_or_handle {
                 self.by_handle.remove(handle.inner());
@@ -135,8 +135,8 @@ impl InodeStore {
         self.by_ids.clear();
     }
 
-    pub fn get(&self, inode: &Inode) -> Option<&Arc<InodeData>> {
-        self.data.get(inode)
+    pub fn get(&self, inode: Inode) -> Option<&Arc<InodeData>> {
+        self.data.get(&inode)
     }
 
     pub fn get_by_ids(&self, ids: &InodeIds) -> Option<&Arc<InodeData>> {
@@ -148,11 +148,11 @@ impl InodeStore {
             .map(|inode| self.get(inode).unwrap())
     }
 
-    pub fn inode_by_ids(&self, ids: &InodeIds) -> Option<&Inode> {
-        self.by_ids.get(ids)
+    pub fn inode_by_ids(&self, ids: &InodeIds) -> Option<Inode> {
+        self.by_ids.get(ids).copied()
     }
 
-    pub fn inode_by_handle(&self, handle: &FileHandle) -> Option<&Inode> {
-        self.by_handle.get(handle)
+    pub fn inode_by_handle(&self, handle: &FileHandle) -> Option<Inode> {
+        self.by_handle.get(handle).copied()
     }
 }
