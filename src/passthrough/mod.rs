@@ -17,7 +17,9 @@ use crate::filesystem::{
     SecContext, SetattrValid, SetxattrFlags, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::passthrough::credentials::{drop_effective_cap, UnixCredentials};
-use crate::passthrough::inode_store::{Inode, InodeData, InodeFile, InodeIds, InodeStore};
+use crate::passthrough::inode_store::{
+    Inode, InodeData, InodeFile, InodeIds, InodeStore, StrongInodeReference,
+};
 use crate::passthrough::util::{ebadf, is_safe_inode, openat, reopen_fd_through_proc};
 use crate::read_dir::ReadDir;
 use crate::{fuse, oslib};
@@ -632,9 +634,25 @@ impl PassthroughFs {
         Ok(())
     }
 
-    fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        let p = self.inodes.get(parent).ok_or_else(ebadf)?;
-        let p_file = p.get_file()?;
+    /// Try to look up an inode by its `name` relative to the given `parent` inode.  If the inode
+    /// is registered in our inode store (`self.inodes`), return a strong reference to it.
+    /// Otherwise, return `None` instead.
+    /// Along with the inode (or `None`), return information gathered along the way: An `O_PATH`
+    /// file to the inode, stat information, and optionally a file handle if virtiofsd has been
+    /// configured to use file handles.
+    /// Return an error if the parent node cannot be opened, the given inode cannot be found on the
+    /// filesystem, or generating the stat information or file handle fails.
+    fn try_lookup_implementation(
+        &self,
+        parent_data: &InodeData,
+        name: &CStr,
+    ) -> io::Result<(
+        Option<StrongInodeReference>,
+        File,
+        StatExt,
+        Option<FileHandle>,
+    )> {
+        let p_file = parent_data.get_file()?;
 
         let path_fd = {
             let fd = self.open_relative_to(&p_file, name, libc::O_PATH, None)?;
@@ -649,6 +667,39 @@ impl PassthroughFs {
         // `cfg.inode_file_handles` is `Never`, we do not need it anyway.
         let handle = self.get_file_handle_opt(&path_fd, &st)?;
 
+        let ids = InodeIds {
+            ino: st.st.st_ino,
+            dev: st.st.st_dev,
+            mnt_id: st.mnt_id,
+        };
+
+        Ok((
+            self.inodes.claim_inode(handle.as_ref(), &ids).ok(),
+            path_fd,
+            st,
+            handle,
+        ))
+    }
+
+    /// Try to look up an inode by its `name` relative to the parent inode given by its
+    /// `parent_data`.  If the inode is registered in our inode store (`self.inodes`), return a
+    /// strong reference to it.  Otherwise, return `None`.
+    /// Return an error if the parent node cannot be opened, the given inode cannot be found on the
+    /// filesystem, or generating the Stat information or file handle fails.
+    #[allow(unused)]
+    fn try_lookup(
+        &self,
+        parent_data: &InodeData,
+        name: &CStr,
+    ) -> io::Result<Option<StrongInodeReference>> {
+        self.try_lookup_implementation(parent_data, name)
+            .map(|result| result.0)
+    }
+
+    fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        let p = self.inodes.get(parent).ok_or_else(ebadf)?;
+        let (existing_inode, path_fd, st, handle) = self.try_lookup_implementation(&p, name)?;
+
         let mut attr_flags: u32 = 0;
 
         if st.st.st_mode & libc::S_IFMT == libc::S_IFDIR
@@ -657,14 +708,6 @@ impl PassthroughFs {
         {
             attr_flags |= fuse::ATTR_SUBMOUNT;
         }
-
-        let ids = InodeIds {
-            ino: st.st.st_ino,
-            dev: st.st.st_dev,
-            mnt_id: st.mnt_id,
-        };
-
-        let existing_inode = self.inodes.claim_inode(handle.as_ref(), &ids).ok();
 
         let inode = if let Some(inode) = existing_inode {
             inode
@@ -679,7 +722,11 @@ impl PassthroughFs {
                 inode: self.next_inode.fetch_add(1, Ordering::Relaxed),
                 file_or_handle,
                 refcount: AtomicU64::new(1),
-                ids,
+                ids: InodeIds {
+                    ino: st.st.st_ino,
+                    dev: st.st.st_dev,
+                    mnt_id: st.mnt_id,
+                },
                 mode: st.st.st_mode,
             };
             self.inodes.get_or_insert(inode_data)?
