@@ -726,16 +726,20 @@ struct Opt {
     ///
     /// For example, :0:100000:65536: will map the 65536 host UIDs [100000, 165535]
     /// into the namespace as [0, 65535].
+    ///
+    /// Provide this argument multiple times to map multiple UID ranges.
     #[arg(long)]
-    uid_map: Option<UidMap>,
+    uid_map: Vec<UidMap>,
 
     /// Map a range of GIDs from the host into the namespace, given as
     /// :namespace_gid:host_gid:count:
     ///
     /// For example, :0:100000:65536: will map the 65536 host GIDs [100000, 165535]
     /// into the namespace as [0, 65535].
+    ///
+    /// Provide this argument multiple times to map multiple GID ranges.
     #[arg(long)]
-    gid_map: Option<GidMap>,
+    gid_map: Vec<GidMap>,
 
     /// Preserve O_NOATIME behavior, otherwise automatically clean up O_NOATIME flag to prevent
     /// potential permission errors when running in unprivileged mode (e.g., when accessing files
