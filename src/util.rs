@@ -7,7 +7,6 @@ use std::io::{Error, ErrorKind, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
-use std::result::Result;
 use std::{fs, io, process};
 
 fn try_lock_file(file: &File) -> Result<(), Error> {

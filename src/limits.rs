@@ -2,7 +2,6 @@
 
 use libc::{getrlimit, rlim_t, rlimit, setrlimit, RLIMIT_NOFILE};
 use std::mem::MaybeUninit;
-use std::result::Result;
 use std::{cmp, fs, io};
 
 // Default number of open files (RLIMIT_NOFILE)
