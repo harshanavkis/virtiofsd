@@ -1350,6 +1350,7 @@ impl FileSystem for PassthroughFs {
         // Since we are going to work with the kernel offset, we have to acquire the file
         // lock for both the `lseek64` and `getdents64` syscalls to ensure that no other
         // thread changes the kernel offset while we are using it.
+        #[allow(clippy::readonly_write_lock)]
         let dir = data.file.write().unwrap();
 
         ReadDir::new(&*dir, offset as libc::off64_t, buf)
