@@ -47,7 +47,7 @@ pub struct UidMap {
 impl FromStr for UidMap {
     type Err = IdMapError;
 
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         let fields = parse_idmap(s, 3)?;
 
         Ok(UidMap {
@@ -78,7 +78,7 @@ pub struct GidMap {
 impl FromStr for GidMap {
     type Err = IdMapError;
 
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         let fields = parse_idmap(s, 3)?;
 
         Ok(GidMap {
@@ -99,7 +99,7 @@ impl fmt::Display for GidMap {
     }
 }
 
-fn parse_idmap(s: &str, expected_len: usize) -> std::result::Result<Vec<u32>, IdMapError> {
+fn parse_idmap(s: &str, expected_len: usize) -> Result<Vec<u32>, IdMapError> {
     let mut s = String::from(s);
     let delimiter = s.pop().ok_or(IdMapError::IncompleteMap)?;
     if delimiter.is_alphanumeric() {
