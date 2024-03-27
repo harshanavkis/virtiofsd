@@ -153,17 +153,17 @@ pub struct Sandbox {
     /// Mechanism to be used for setting up the sandbox.
     sandbox_mode: SandboxMode,
     /// UidMap to be used for `newuidmap(1)` command line arguments
-    uid_map: Option<UidMap>,
+    uid_map: Vec<UidMap>,
     /// GidMap to be used for `newgidmap(1)` command line arguments
-    gid_map: Option<GidMap>,
+    gid_map: Vec<GidMap>,
 }
 
 impl Sandbox {
     pub fn new(
         shared_dir: String,
         sandbox_mode: SandboxMode,
-        uid_map: Option<UidMap>,
-        gid_map: Option<GidMap>,
+        uid_map: Vec<UidMap>,
+        gid_map: Vec<GidMap>,
     ) -> io::Result<Self> {
         let shared_dir_rp = fs::canonicalize(shared_dir)?;
         let shared_dir_rp_str = shared_dir_rp
@@ -311,36 +311,49 @@ impl Sandbox {
     /// Sets mappings for the given uid and gid.
     fn setup_id_mappings(
         &self,
-        uid_map: Option<UidMap>,
-        gid_map: Option<GidMap>,
+        uid_map: &[UidMap],
+        gid_map: &[GidMap],
         pid: i32,
     ) -> Result<(), Error> {
         let current_uid = unsafe { libc::geteuid() };
         let current_gid = unsafe { libc::getegid() };
+
         // Take uid map or set up a 1-to-1 mapping for our current euid.
-        let uid_map = uid_map.unwrap_or(UidMap {
+        let default_uid_map = vec![UidMap {
             outside_uid: current_uid,
             inside_uid: current_uid,
             count: 1,
-        });
+        }];
+        let uid_map = if uid_map.is_empty() {
+            &default_uid_map
+        } else {
+            uid_map
+        };
 
         // Take gid map or set up a 1-to-1 mapping for our current gid.
-        let gid_map = gid_map.unwrap_or(GidMap {
+        let default_gid_map = vec![GidMap {
             outside_gid: current_gid,
             inside_gid: current_gid,
             count: 1,
-        });
+        }];
+        let gid_map = if gid_map.is_empty() {
+            &default_gid_map
+        } else {
+            gid_map
+        };
 
         // Unprivileged user can not set any mapping without any restriction.
         // Therefore, newuidmap/newgidmap is used instead of writing directly
         // into proc/[pid]/{uid,gid}_map if a potentially privileged action is
         // requested (outside {u,g}id != e{u,g}id or count > 1).
-        if uid_map.outside_uid != current_uid || uid_map.count > 1 {
+        if uid_map.len() != 1 || uid_map[0].outside_uid != current_uid || uid_map[0].count > 1 {
             let mut newuidmap = Command::new("newuidmap");
             newuidmap.arg(pid.to_string());
-            newuidmap.arg(uid_map.inside_uid.to_string());
-            newuidmap.arg(uid_map.outside_uid.to_string());
-            newuidmap.arg(uid_map.count.to_string());
+            for entry in uid_map.iter() {
+                newuidmap.arg(entry.inside_uid.to_string());
+                newuidmap.arg(entry.outside_uid.to_string());
+                newuidmap.arg(entry.count.to_string());
+            }
             let output = newuidmap.output().map_err(|_| {
                 Error::WriteUidMap(format!(
                     "failed to execute newuidmap: {}",
@@ -356,17 +369,19 @@ impl Sandbox {
             // Unprivileged part, we can driectly write to /proc/[pid]/uid_map.
             std::fs::write(
                 format!("/proc/{pid}/uid_map"),
-                format!("{} {} 1", uid_map.inside_uid, uid_map.outside_uid),
+                format!("{} {} 1", uid_map[0].inside_uid, uid_map[0].outside_uid),
             )
             .map_err(|e| Error::WriteUidMap(e.to_string()))?;
         }
 
-        if gid_map.outside_gid != current_gid || gid_map.count > 1 {
+        if gid_map.len() != 1 || gid_map[0].outside_gid != current_gid || gid_map[0].count > 1 {
             let mut newgidmap = Command::new("newgidmap");
             newgidmap.arg(pid.to_string());
-            newgidmap.arg(gid_map.inside_gid.to_string());
-            newgidmap.arg(gid_map.outside_gid.to_string());
-            newgidmap.arg(gid_map.count.to_string());
+            for entry in gid_map.iter() {
+                newgidmap.arg(entry.inside_gid.to_string());
+                newgidmap.arg(entry.outside_gid.to_string());
+                newgidmap.arg(entry.count.to_string());
+            }
             let output = newgidmap.output().map_err(|_| {
                 Error::WriteGidMap(format!(
                     "failed to execute newgidmap: {}",
@@ -384,7 +399,7 @@ impl Sandbox {
                 .map_err(|e| Error::WriteGidMap(e.to_string()))?;
             std::fs::write(
                 format!("/proc/{pid}/gid_map"),
-                format!("{} {} 1", gid_map.inside_gid, gid_map.outside_gid),
+                format!("{} {} 1", gid_map[0].inside_gid, gid_map[0].outside_gid),
             )
             .map_err(|e| Error::WriteGidMap(e.to_string()))?;
         }
@@ -424,9 +439,7 @@ impl Sandbox {
             // Setup uid/gid mappings
             if uid != 0 {
                 let ppid = unsafe { libc::getppid() };
-                if let Err(error) =
-                    self.setup_id_mappings(self.uid_map.clone(), self.gid_map.clone(), ppid)
-                {
+                if let Err(error) = self.setup_id_mappings(&self.uid_map, &self.gid_map, ppid) {
                     // We don't really need to close the pipes here, since the OS will close the FDs
                     // after the process exits. But let's do it explicitly to signal an error to the
                     // other end of the pipe.
@@ -579,11 +592,11 @@ impl Sandbox {
             return Err(Error::SandboxModeInvalidUID);
         }
 
-        if self.uid_map.is_some() && (uid == 0 || self.sandbox_mode != SandboxMode::Namespace) {
+        if !self.uid_map.is_empty() && (uid == 0 || self.sandbox_mode != SandboxMode::Namespace) {
             return Err(Error::SandboxModeInvalidUidMap);
         }
 
-        if self.gid_map.is_some() && (uid == 0 || self.sandbox_mode != SandboxMode::Namespace) {
+        if !self.gid_map.is_empty() && (uid == 0 || self.sandbox_mode != SandboxMode::Namespace) {
             return Err(Error::SandboxModeInvalidGidMap);
         }
 
