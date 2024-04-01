@@ -7,7 +7,6 @@ use std::io::{Error, ErrorKind, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
-use std::result::Result;
 use std::{fs, io, process};
 
 fn try_lock_file(file: &File) -> Result<(), Error> {
@@ -20,7 +19,7 @@ fn try_lock_file(file: &File) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn write_pid_file(pid_file_name: &Path) -> std::result::Result<File, std::io::Error> {
+pub fn write_pid_file(pid_file_name: &Path) -> Result<File, std::io::Error> {
     let mut pid_file = loop {
         let file = OpenOptions::new()
             .mode(libc::S_IRUSR | libc::S_IWUSR)
