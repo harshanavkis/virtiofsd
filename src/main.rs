@@ -43,7 +43,7 @@ use vm_memory::{
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 
-const QUEUE_SIZE: usize = 1024;
+const QUEUE_SIZE: usize = 32768;
 // The spec allows for multiple request queues. We currently only support one.
 const REQUEST_QUEUES: u32 = 1;
 // In addition to the request queue there is one high-prio queue.
