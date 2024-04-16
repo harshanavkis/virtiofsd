@@ -1041,7 +1041,10 @@ fn parse_compat(opt: Opt) -> Opt {
 
 fn print_capabilities() {
     println!("{{");
-    println!("  \"type\": \"fs\"");
+    println!("  \"type\": \"fs\",");
+    println!("  \"features\": [");
+    println!("    \"migrate-precopy\"");
+    println!("  ]");
     println!("}}");
 }
 
