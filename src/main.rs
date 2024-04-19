@@ -1066,6 +1066,19 @@ fn main() {
                 opt.socket.as_ref().unwrap() // safe to unwrap because clap ensures either --socket or --socket-path are passed
             });
 
+            let socket_parent_dir = Path::new(socket).parent().unwrap_or_else(|| {
+                error!("Invalid socket file name");
+                process::exit(1);
+            });
+
+            if !socket_parent_dir.as_os_str().is_empty() && !socket_parent_dir.exists() {
+                error!(
+                    "{} does not exist or is not a directory",
+                    socket_parent_dir.to_string_lossy()
+                );
+                process::exit(1);
+            }
+
             let pid_file_name = socket.to_owned() + ".pid";
             let pid_file_path = Path::new(pid_file_name.as_str());
             let pid_file = write_pid_file(pid_file_path).unwrap_or_else(|error| {
