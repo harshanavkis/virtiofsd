@@ -1007,6 +1007,13 @@ fn main() {
             process::exit(1);
         }
     };
+
+    let shadir_path = Path::new(shared_dir);
+    if !shadir_path.is_dir() && !shadir_path.is_file() {
+        error!("{shared_dir} does not exist");
+        process::exit(1);
+    }
+
     if opt.compat_foreground {
         warn!("Use of deprecated flag '-f': This flag has no effect, please remove it");
     }
