@@ -1007,6 +1007,13 @@ fn main() {
             process::exit(1);
         }
     };
+
+    let shadir_path = Path::new(shared_dir);
+    if !shadir_path.is_dir() && !shadir_path.is_file() {
+        error!("{shared_dir} does not exist");
+        process::exit(1);
+    }
+
     if opt.compat_foreground {
         warn!("Use of deprecated flag '-f': This flag has no effect, please remove it");
     }
@@ -1058,6 +1065,19 @@ fn main() {
                 warn!("use of deprecated parameter '--socket': Please use the '--socket-path' option instead");
                 opt.socket.as_ref().unwrap() // safe to unwrap because clap ensures either --socket or --socket-path are passed
             });
+
+            let socket_parent_dir = Path::new(socket).parent().unwrap_or_else(|| {
+                error!("Invalid socket file name");
+                process::exit(1);
+            });
+
+            if !socket_parent_dir.as_os_str().is_empty() && !socket_parent_dir.exists() {
+                error!(
+                    "{} does not exist or is not a directory",
+                    socket_parent_dir.to_string_lossy()
+                );
+                process::exit(1);
+            }
 
             let pid_file_name = socket.to_owned() + ".pid";
             let pid_file_path = Path::new(pid_file_name.as_str());
