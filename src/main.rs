@@ -577,7 +577,7 @@ fn parse_tag(tag: &str) -> Result<String> {
 )]
 struct Opt {
     /// Shared directory path
-    #[arg(long)]
+    #[arg(long, required_unless_present("compat_options"))]
     shared_dir: Option<String>,
 
     /// The tag that the virtio device advertises
