@@ -7,11 +7,13 @@ use idmap::{GidMap, IdMapSetUpPipeMessage, UidMap};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::process::{self, Command};
 use std::str::FromStr;
 use std::{error, fmt, io};
+use vhost::vhost_user::Listener;
 
 #[derive(Debug)]
 pub enum Error {
@@ -406,7 +408,7 @@ impl Sandbox {
         Ok(())
     }
 
-    pub fn enter_namespace(&mut self) -> Result<(), Error> {
+    pub fn enter_namespace(&mut self, listener: Listener) -> Result<Listener, Error> {
         let uid = unsafe { libc::geteuid() };
 
         let flags = if uid == 0 {
@@ -498,9 +500,27 @@ impl Sandbox {
             if child == 0 {
                 // Second child
                 self.setup_mounts()?;
-                Ok(())
+                Ok(listener)
             } else {
                 // This is the parent
+
+                // The child process drops the `vhost::Listener` after the first
+                // `accept()`. However, since the parent just waits until the child
+                // ends, keeping all the FDs open, as well as the socket's FD in a
+                // listen state. This is problematic because nothing prevents a
+                // miss-configured VMM to try to connect twice to the same socket
+                // leaving the VMM waiting forever. So, let's close the listener
+                // before waiting for the child.
+                let fd = listener.as_raw_fd();
+
+                // `vhost::Listener` beside closing the FD, it will remove the socket, if dropped
+                std::mem::forget(listener);
+
+                // Let's close the FD without removing the socket file
+                // SAFETY: `fd` is open and nobody owns it
+                let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                drop(fd);
+
                 util::wait_for_child(child); // This never returns.
             }
         }
@@ -586,7 +606,7 @@ impl Sandbox {
     }
 
     /// Set up sandbox,
-    pub fn enter(&mut self) -> Result<(), Error> {
+    pub fn enter(&mut self, listener: Listener) -> Result<Listener, Error> {
         let uid = unsafe { libc::geteuid() };
         if uid != 0 && self.sandbox_mode == SandboxMode::Chroot {
             return Err(Error::SandboxModeInvalidUID);
@@ -624,9 +644,9 @@ impl Sandbox {
         }
 
         match self.sandbox_mode {
-            SandboxMode::Namespace => self.enter_namespace(),
-            SandboxMode::Chroot => self.enter_chroot(),
-            SandboxMode::None => Ok(()),
+            SandboxMode::Namespace => self.enter_namespace(listener),
+            SandboxMode::Chroot => self.enter_chroot().and(Ok(listener)),
+            SandboxMode::None => Ok(listener),
         }
     }
 
