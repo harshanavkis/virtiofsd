@@ -1113,7 +1113,7 @@ fn main() {
 
     // Enter the sandbox, from this point the process will be isolated (or not)
     // as chosen in '--sandbox'.
-    sandbox.enter().unwrap_or_else(|error| {
+    let listener = sandbox.enter(listener).unwrap_or_else(|error| {
         error!("Error entering sandbox: {}", error);
         process::exit(1)
     });
