@@ -165,3 +165,26 @@ pub fn add_cap_to_eff(cap_name: &str) -> capng::Result<()> {
 pub fn other_io_error<E: Into<Box<dyn std::error::Error + Send + Sync>>>(err: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, err)
 }
+
+/// Trait for `Error` object that allows prepending the error message by something that gives
+/// context
+pub trait ErrorContext {
+    fn context<C: std::fmt::Display>(self, context: C) -> Self;
+}
+
+impl ErrorContext for io::Error {
+    fn context<C: std::fmt::Display>(self, context: C) -> Self {
+        io::Error::new(self.kind(), format!("{context}: {self}"))
+    }
+}
+
+/// Lifts the `ErrorContext` trait to `Result` types
+pub trait ResultErrorContext {
+    fn err_context<C: std::fmt::Display, F: FnOnce() -> C>(self, context: F) -> Self;
+}
+
+impl<V, E: ErrorContext> ResultErrorContext for Result<V, E> {
+    fn err_context<C: std::fmt::Display, F: FnOnce() -> C>(self, context: F) -> Self {
+        self.map_err(|err| err.context(context()))
+    }
+}
