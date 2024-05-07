@@ -211,6 +211,11 @@ impl InodeStoreInner {
     fn clear_migration_info(&mut self) {
         let mut strong_references = Vec::<StrongInodeReference>::new();
         for inode in self.data.values() {
+            if inode.inode == fuse::ROOT_ID {
+                // Ignore root inode, we always want to keep its migration info around
+                continue;
+            }
+
             if let Some(mig_info) = inode.migration_info.lock().unwrap().take() {
                 match mig_info.location {
                     InodeLocation::RootNode => (),
