@@ -24,11 +24,11 @@ use std::sync::{Arc, Mutex};
 /// should only be done when necessary, i.e. when actually preparing for migration.
 pub(in crate::passthrough) struct InodeMigrationInfo {
     /// Location of the inode (how the destination can find it)
-    pub(in crate::passthrough) location: InodeLocation,
+    pub location: InodeLocation,
 
     /// The inode's file handle.  The destination is not supposed to open this handle, but instead
     /// compare it against the one from the inode it has opened based on `location`.
-    pub(in crate::passthrough) file_handle: Option<SerializableFileHandle>,
+    pub file_handle: Option<SerializableFileHandle>,
 }
 
 pub(in crate::passthrough) enum InodeLocation {
@@ -55,7 +55,7 @@ pub(in crate::passthrough) enum HandleMigrationInfo {
 
 /// Stores state for constructing serializable data for inodes using the `InodeMigrationInfo::Path`
 /// variant, in order to prepare for migration.
-pub(super) struct PathReconstructor<'a> {
+pub(in crate::passthrough::device_state) struct PathReconstructor<'a> {
     /// Reference to the filesystem for which to reconstruct inodes' paths.
     fs: &'a PassthroughFs,
     /// Set to true when we are supposed to cancel
@@ -66,7 +66,7 @@ pub(super) struct PathReconstructor<'a> {
 /// time, and is the core part of our preserialization phase.
 /// Different implementations of this trait can create different variants of the
 /// `InodeMigrationInfo` enum.
-pub(super) trait InodeMigrationInfoConstructor {
+pub(in crate::passthrough::device_state) trait InodeMigrationInfoConstructor {
     /// Runs the constructor.  Must not fail: Collecting inodes’ migration info is supposed to be a
     /// best-effort operation.  We can leave any and even all inodes’ migration info empty, then
     /// serialize them as invalid inodes, and let the destination decide what to do based on its
@@ -77,7 +77,7 @@ pub(super) trait InodeMigrationInfoConstructor {
 impl InodeMigrationInfo {
     /// Create the migration info for an inode that is collected during the `prepare_serialization`
     /// phase
-    pub(in crate::passthrough) fn new(
+    pub fn new(
         fs_cfg: &passthrough::Config,
         parent_ref: StrongInodeReference,
         filename: &CStr,
@@ -143,7 +143,7 @@ impl InodeMigrationInfo {
 
 impl HandleMigrationInfo {
     /// Create the migration info for a handle that will be required when serializing
-    pub(in crate::passthrough) fn new(flags: i32) -> Self {
+    pub fn new(flags: i32) -> Self {
         HandleMigrationInfo::OpenInode {
             // Remove flags that make sense when the file is first opened by the guest, but which
             // we should not set when continuing to use the file after migration because they would
@@ -158,7 +158,7 @@ impl HandleMigrationInfo {
 /// directory), matching up all inodes it finds with our inode store, and thus finds the parent
 /// directory node and filename for every such inode.
 impl<'a> PathReconstructor<'a> {
-    pub(super) fn new(fs: &'a PassthroughFs, cancel: Arc<AtomicBool>) -> Self {
+    pub fn new(fs: &'a PassthroughFs, cancel: Arc<AtomicBool>) -> Self {
         PathReconstructor { fs, cancel }
     }
 
