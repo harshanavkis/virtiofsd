@@ -130,6 +130,15 @@ impl InodeMigrationInfo {
             file_handle,
         })
     }
+
+    /// Call the given function for each `StrongInodeReference` contained in this
+    /// `InodeMigrationInfo`
+    pub fn for_each_strong_reference<F: FnMut(StrongInodeReference)>(self, mut f: F) {
+        match self.location {
+            InodeLocation::RootNode => (),
+            InodeLocation::Path { parent, .. } => f(parent),
+        }
+    }
 }
 
 impl HandleMigrationInfo {

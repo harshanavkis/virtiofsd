@@ -2,7 +2,7 @@
 // found in the LICENSE-BSD-3-Clause file.
 
 use crate::fuse;
-use crate::passthrough::device_state::preserialization::{InodeLocation, InodeMigrationInfo};
+use crate::passthrough::device_state::preserialization::InodeMigrationInfo;
 use crate::passthrough::file_handle::{FileHandle, FileOrHandle};
 use crate::passthrough::stat::MountId;
 use crate::passthrough::util::{ebadf, get_path_by_fd, is_safe_inode, reopen_fd_through_proc};
@@ -215,10 +215,7 @@ impl InodeStoreInner {
             }
             self.by_ids.remove(&data.ids);
             if let Some(mig_info) = data.migration_info.lock().unwrap().take() {
-                match mig_info.location {
-                    InodeLocation::RootNode => (),
-                    InodeLocation::Path { parent, .. } => parent.drop_unlocked(self),
-                }
+                mig_info.for_each_strong_reference(|strong_ref| strong_ref.drop_unlocked(self));
             }
         }
     }
@@ -240,10 +237,7 @@ impl InodeStoreInner {
             }
 
             if let Some(mig_info) = inode.migration_info.lock().unwrap().take() {
-                match mig_info.location {
-                    InodeLocation::RootNode => (),
-                    InodeLocation::Path { parent, .. } => strong_references.push(parent),
-                }
+                mig_info.for_each_strong_reference(|strong_ref| strong_references.push(strong_ref));
             }
         }
         for strong_reference in strong_references {
