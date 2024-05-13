@@ -40,7 +40,7 @@ impl SerializableFileSystem for PassthroughFs {
 
         // Create the reconstructor (which reconstructs parent+filename information for each node
         // in our inode store), and run it
-        let reconstructor = find_paths::PathReconstructor::new(self, cancel);
+        let reconstructor = find_paths::Constructor::new(self, cancel);
         reconstructor.execute();
     }
 

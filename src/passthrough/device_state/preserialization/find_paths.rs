@@ -27,7 +27,7 @@ pub(in crate::passthrough) struct InodePath {
 
 /// Stores state for constructing serializable data for inodes using the `InodeMigrationInfo::Path`
 /// variant, in order to prepare for migration.
-pub(in crate::passthrough::device_state) struct PathReconstructor<'a> {
+pub(in crate::passthrough::device_state) struct Constructor<'a> {
     /// Reference to the filesystem for which to reconstruct inodes' paths.
     fs: &'a PassthroughFs,
     /// Set to true when we are supposed to cancel
@@ -61,13 +61,13 @@ impl From<InodePath> for InodeLocation {
     }
 }
 
-/// The `PathReconstructor` is an `InodeMigrationInfoConstructor` that creates `InodeMigrationInfo`
-/// of the `InodeMigrationInfo::Path` variant: It recurses through the filesystem (i.e. the shared
+/// The `Constructor` is an `InodeMigrationInfoConstructor` that creates `InodeMigrationInfo` of
+/// the `InodeMigrationInfo::Path` variant: It recurses through the filesystem (i.e. the shared
 /// directory), matching up all inodes it finds with our inode store, and thus finds the parent
 /// directory node and filename for every such inode.
-impl<'a> PathReconstructor<'a> {
+impl<'a> Constructor<'a> {
     pub fn new(fs: &'a PassthroughFs, cancel: Arc<AtomicBool>) -> Self {
-        PathReconstructor { fs, cancel }
+        Constructor { fs, cancel }
     }
 
     /// Recurse from the given directory inode
@@ -229,7 +229,7 @@ impl<'a> PathReconstructor<'a> {
     }
 }
 
-impl InodeMigrationInfoConstructor for PathReconstructor<'_> {
+impl InodeMigrationInfoConstructor for Constructor<'_> {
     /// Recurse from the root directory (the shared directory)
     fn execute(self) {
         // Only need to do something if we have a root node to recurse from; otherwise the
