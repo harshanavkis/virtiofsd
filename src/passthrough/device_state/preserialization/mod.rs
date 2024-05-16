@@ -36,6 +36,15 @@ pub(in crate::passthrough) enum InodeLocation {
     Path(find_paths::InodePath),
 }
 
+/// Precursor to `SerializableHandleRepresentation` that is constructed while serialization is
+/// being prepared, and will then be transformed into the latter at the time of serialization.
+/// To be stored in the `handles` map, alongside each handle (i.e. in its `HandleData`).
+/// Constructing this is cheap, so can be done whenever any handle is created.
+pub(in crate::passthrough) enum HandleMigrationInfo {
+    /// Handle can be opened by opening its associated inode with the given `open(2)` flags
+    OpenInode { flags: i32 },
+}
+
 impl InodeMigrationInfo {
     /// General function for public use that creates the correct `InodeLocation` variant based on
     /// the `migration_mode` setting
@@ -88,6 +97,18 @@ impl InodeMigrationInfo {
         match self.location {
             InodeLocation::RootNode => (),
             InodeLocation::Path(p) => p.for_each_strong_reference(f),
+        }
+    }
+}
+
+impl HandleMigrationInfo {
+    /// Create the migration info for a handle that will be required when serializing
+    pub fn new(flags: i32) -> Self {
+        HandleMigrationInfo::OpenInode {
+            // Remove flags that make sense when the file is first opened by the guest, but which
+            // we should not set when continuing to use the file after migration because they would
+            // e.g. modify the file
+            flags: flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC),
         }
     }
 }
