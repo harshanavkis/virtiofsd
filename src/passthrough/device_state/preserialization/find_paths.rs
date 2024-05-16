@@ -2,12 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use super::{InodeLocation, InodeMigrationInfo};
 use crate::filesystem::DirectoryIterator;
 use crate::fuse;
-use crate::passthrough::file_handle::{FileHandle, SerializableFileHandle};
+use crate::passthrough::file_handle::FileHandle;
 use crate::passthrough::inode_store::{InodeData, InodeIds, StrongInodeReference};
 use crate::passthrough::stat::statx;
-use crate::passthrough::{self, FileOrHandle, PassthroughFs};
+use crate::passthrough::{FileOrHandle, PassthroughFs};
 use crate::read_dir::ReadDir;
 use crate::util::other_io_error;
 use std::convert::TryInto;
@@ -18,30 +19,10 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Precursor to `serialized::Inode` that is constructed while serialization is being prepared, and
-/// will then be transformed into the latter at the time of serialization.  To be stored in the
-/// inode store, alongside each inode (i.e. in its `InodeData`).  Constructing this is costly, so
-/// should only be done when necessary, i.e. when actually preparing for migration.
-pub(in crate::passthrough) struct InodeMigrationInfo {
-    /// Location of the inode (how the destination can find it)
-    pub location: InodeLocation,
-
-    /// The inode's file handle.  The destination is not supposed to open this handle, but instead
-    /// compare it against the one from the inode it has opened based on `location`.
-    pub file_handle: Option<SerializableFileHandle>,
-}
-
-pub(in crate::passthrough) enum InodeLocation {
-    /// The root node: No information is stored, the destination is supposed to find this on its
-    /// own (as configured by the user)
-    RootNode,
-
-    /// Inode is represented by its parent directory and its filename therein, allowing the
-    /// destination to `openat(2)` it
-    Path {
-        parent: StrongInodeReference,
-        filename: String,
-    },
+/// The result of 'find-paths' pre-serialization: A filename relative to some parent inode.
+pub(in crate::passthrough) struct InodePath {
+    pub parent: StrongInodeReference,
+    pub filename: String,
 }
 
 /// Precursor to `SerializableHandleRepresentation` that is constructed while serialization is
@@ -74,70 +55,30 @@ pub(in crate::passthrough::device_state) trait InodeMigrationInfoConstructor {
     fn execute(self);
 }
 
-impl InodeMigrationInfo {
+impl InodePath {
     /// Create the migration info for an inode that is collected during the `prepare_serialization`
     /// phase
-    pub fn new(
-        fs_cfg: &passthrough::Config,
-        parent_ref: StrongInodeReference,
-        filename: &CStr,
-        file_or_handle: &FileOrHandle,
-    ) -> io::Result<Self> {
+    pub fn new_with_cstr(parent_ref: StrongInodeReference, filename: &CStr) -> io::Result<Self> {
         let utf8_name = filename.to_str().map_err(|err| {
             other_io_error(format!(
                 "Cannot convert filename into UTF-8: {filename:?}: {err}"
             ))
         })?;
 
-        Self::new_with_utf8_name(fs_cfg, parent_ref, utf8_name, file_or_handle)
-    }
-
-    fn new_with_utf8_name(
-        fs_cfg: &passthrough::Config,
-        parent_ref: StrongInodeReference,
-        filename: &str,
-        file_or_handle: &FileOrHandle,
-    ) -> io::Result<Self> {
-        let file_handle: Option<SerializableFileHandle> = if fs_cfg.migration_verify_handles {
-            Some(file_or_handle.try_into()?)
-        } else {
-            None
-        };
-
-        Ok(InodeMigrationInfo {
-            location: InodeLocation::Path {
-                parent: parent_ref,
-                filename: filename.to_string(),
-            },
-            file_handle,
+        Ok(InodePath {
+            parent: parent_ref,
+            filename: utf8_name.to_string(),
         })
     }
 
-    /// Use this for the root node.  That node is special in that the destination gets no
-    /// information on how to find it, because that is configured by the user.
-    pub(in crate::passthrough) fn new_root(
-        fs_cfg: &passthrough::Config,
-        file_or_handle: &FileOrHandle,
-    ) -> io::Result<Self> {
-        let file_handle: Option<SerializableFileHandle> = if fs_cfg.migration_verify_handles {
-            Some(file_or_handle.try_into()?)
-        } else {
-            None
-        };
-
-        Ok(InodeMigrationInfo {
-            location: InodeLocation::RootNode,
-            file_handle,
-        })
+    pub(super) fn for_each_strong_reference<F: FnMut(StrongInodeReference)>(self, mut f: F) {
+        f(self.parent);
     }
+}
 
-    /// Call the given function for each `StrongInodeReference` contained in this
-    /// `InodeMigrationInfo`
-    pub fn for_each_strong_reference<F: FnMut(StrongInodeReference)>(self, mut f: F) {
-        match self.location {
-            InodeLocation::RootNode => (),
-            InodeLocation::Path { parent, .. } => f(parent),
-        }
+impl From<InodePath> for InodeLocation {
+    fn from(path: InodePath) -> Self {
+        InodeLocation::Path(path)
     }
 }
 
@@ -260,22 +201,19 @@ impl<'a> PathReconstructor<'a> {
         let is_directory = stat.st.st_mode & libc::S_IFMT == libc::S_IFDIR;
 
         if let Ok(inode_ref) = self.fs.inodes.claim_inode(handle.as_ref(), &ids) {
-            let file_handle = if self.fs.cfg.migration_verify_handles {
-                Some(match &handle {
-                    Some(h) => h.into(),
-                    None => FileHandle::from_fd_fail_hard(&path_fd)?.into(),
-                })
-            } else {
-                None
-            };
-
-            let mig_info = InodeMigrationInfo {
-                location: InodeLocation::Path {
+            let mig_info = InodeMigrationInfo::new_internal(
+                &self.fs.cfg,
+                InodePath {
                     parent: StrongInodeReference::clone(parent_reference),
                     filename: utf8_name.to_string(),
                 },
-                file_handle,
-            };
+                || {
+                    Ok(match &handle {
+                        Some(h) => h.into(),
+                        None => FileHandle::from_fd_fail_hard(&path_fd)?.into(),
+                    })
+                },
+            )?;
 
             *inode_ref.get().migration_info.lock().unwrap() = Some(mig_info);
 
@@ -302,11 +240,13 @@ impl<'a> PathReconstructor<'a> {
             FileOrHandle::File(path_fd)
         };
 
-        let mig_info = InodeMigrationInfo::new_with_utf8_name(
+        let mig_info = InodeMigrationInfo::new_internal(
             &self.fs.cfg,
-            StrongInodeReference::clone(parent_reference),
-            utf8_name,
-            &file_or_handle,
+            InodePath {
+                parent: StrongInodeReference::clone(parent_reference),
+                filename: utf8_name.to_string(),
+            },
+            || (&file_or_handle).try_into(),
         )?;
 
         let new_inode = InodeData {
