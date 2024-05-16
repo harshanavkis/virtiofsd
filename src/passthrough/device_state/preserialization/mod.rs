@@ -45,6 +45,18 @@ pub(in crate::passthrough) enum HandleMigrationInfo {
     OpenInode { flags: i32 },
 }
 
+/// Constructs `InodeMigrationInfo` data for every inode in the inode store.  This may take a long
+/// time, and is the core part of our preserialization phase.
+/// Different implementations of this trait can create different variants of the
+/// `InodeMigrationInfo` enum.
+pub(super) trait InodeMigrationInfoConstructor {
+    /// Runs the constructor.  Must not fail: Collecting inodes’ migration info is supposed to be a
+    /// best-effort operation.  We can leave any and even all inodes’ migration info empty, then
+    /// serialize them as invalid inodes, and let the destination decide what to do based on its
+    /// --migration-on-error setting.
+    fn execute(self);
+}
+
 impl InodeMigrationInfo {
     /// General function for public use that creates the correct `InodeLocation` variant based on
     /// the `migration_mode` setting

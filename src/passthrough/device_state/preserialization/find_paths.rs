@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use super::{InodeLocation, InodeMigrationInfo};
+use super::{InodeLocation, InodeMigrationInfo, InodeMigrationInfoConstructor};
 use crate::filesystem::DirectoryIterator;
 use crate::fuse;
 use crate::passthrough::file_handle::FileHandle;
@@ -32,18 +32,6 @@ pub(in crate::passthrough::device_state) struct PathReconstructor<'a> {
     fs: &'a PassthroughFs,
     /// Set to true when we are supposed to cancel
     cancel: Arc<AtomicBool>,
-}
-
-/// Constructs `InodeMigrationInfo` data for every inode in the inode store.  This may take a long
-/// time, and is the core part of our preserialization phase.
-/// Different implementations of this trait can create different variants of the
-/// `InodeMigrationInfo` enum.
-pub(in crate::passthrough::device_state) trait InodeMigrationInfoConstructor {
-    /// Runs the constructor.  Must not fail: Collecting inodes’ migration info is supposed to be a
-    /// best-effort operation.  We can leave any and even all inodes’ migration info empty, then
-    /// serialize them as invalid inodes, and let the destination decide what to do based on its
-    /// --migration-on-error setting.
-    fn execute(self);
 }
 
 impl InodePath {
