@@ -261,6 +261,12 @@ The caching policy the file system should use (auto, always, metadata, never).
 Default: auto.
 
 ```shell
+--allow-mmap
+```
+
+For shared directories with `--cache={metadata, never}`, allow files contained in the shared directory to be `mmap`'d.
+
+```shell
 --inode-file-handles=<inode-file-handles>
 ```
 When to use file handles to reference inodes instead of `O_PATH` file descriptors (never, prefer, mandatory).

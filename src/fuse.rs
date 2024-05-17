@@ -200,6 +200,9 @@ const HAS_INODE_DAX: u64 = 1 << 33;
 /// and mknod (single group that matches parent)
 const CREATE_SUPP_GROUP: u64 = 1 << 34;
 
+/// Relax restrictions in FOPEN_DIRECT_IO mode to allow shared mmap.
+const DIRECT_IO_ALLOW_MMAP: u64 = 1 << 36;
+
 bitflags! {
     /// A bitfield passed in as a parameter to and returned from the `init` method of the
     /// `FileSystem` trait.
@@ -450,6 +453,9 @@ bitflags! {
         /// Add supplementary groups info to create, mkdir, symlink
         /// and mknod (single group that matches parent).
         const CREATE_SUPP_GROUP = CREATE_SUPP_GROUP;
+
+        /// Allow shared mmap'ing of files in DIRECT_IO.
+        const DIRECT_IO_ALLOW_MMAP = DIRECT_IO_ALLOW_MMAP;
     }
 }
 

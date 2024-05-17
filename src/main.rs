@@ -663,6 +663,9 @@ struct Opt {
     #[arg(long, default_value = "auto")]
     cache: CachePolicy,
 
+    #[arg(long)]
+    allow_mmap: bool,
+
     /// Disable support for READDIRPLUS operations
     #[arg(long)]
     no_readdirplus: bool,
@@ -1157,6 +1160,7 @@ fn main() {
         security_label: opt.security_label,
         posix_acl: opt.posix_acl,
         clean_noatime: !opt.preserve_noatime && !has_noatime_capability(),
+        allow_mmap: opt.allow_mmap,
         ..Default::default()
     };
 
