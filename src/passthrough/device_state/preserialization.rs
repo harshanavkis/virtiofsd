@@ -28,7 +28,6 @@ pub(in crate::passthrough) struct InodeMigrationInfo {
 
     /// The inode's file handle.  The destination is not supposed to open this handle, but instead
     /// compare it against the one from the inode it has opened based on `location`.
-    #[allow(dead_code)] // will be used once serialization is implemented
     pub(in crate::passthrough) file_handle: Option<SerializableFileHandle>,
 }
 
@@ -40,9 +39,7 @@ pub(in crate::passthrough) enum InodeLocation {
     /// Inode is represented by its parent directory and its filename therein, allowing the
     /// destination to `openat(2)` it
     Path {
-        #[allow(dead_code)] // will be used once serialization is implemented
         parent: StrongInodeReference,
-        #[allow(dead_code)] // will be used once serialization is implemented
         filename: String,
     },
 }
@@ -53,10 +50,7 @@ pub(in crate::passthrough) enum InodeLocation {
 /// Constructing this is cheap, so can be done whenever any handle is created.
 pub(in crate::passthrough) enum HandleMigrationInfo {
     /// Handle can be opened by opening its associated inode with the given `open(2)` flags
-    OpenInode {
-        #[allow(dead_code)] // will be used once serialization is implemented
-        flags: i32,
-    },
+    OpenInode { flags: i32 },
 }
 
 /// Stores state for constructing serializable data for inodes using the `InodeMigrationInfo::Path`

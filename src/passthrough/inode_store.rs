@@ -289,6 +289,12 @@ impl InodeStore {
         self.inner.read().unwrap().inode_by_handle(handle)
     }
 
+    /// Invoke `func()` on each inode, collect all results, and return them.  Note that the inode
+    /// store is read-locked when `func()` is called.
+    pub fn map<V, F: Fn(&Arc<InodeData>) -> V>(&self, func: F) -> Vec<V> {
+        self.inner.read().unwrap().data.values().map(func).collect()
+    }
+
     /// Turn the weak reference `inode` into a strong one (increments its refcount)
     pub fn get_strong(&self, inode: Inode) -> io::Result<StrongInodeReference> {
         StrongInodeReference::new(inode, self)

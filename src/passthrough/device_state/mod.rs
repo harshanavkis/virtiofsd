@@ -10,14 +10,18 @@
  *                     i.e. define and construct the precursors to the eventually serialized
  *                     information that are stored alongside the associated inodes and handles they
  *                     describe
+ * - serialization: Functionality for serializing
  */
 pub(super) mod preserialization;
+mod serialization;
 mod serialized;
 
 use crate::filesystem::SerializableFileSystem;
 use crate::passthrough::PassthroughFs;
 use preserialization::{InodeMigrationInfoConstructor, PathReconstructor};
-use std::io;
+use std::convert::TryInto;
+use std::fs::File;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -41,5 +45,15 @@ impl SerializableFileSystem for PassthroughFs {
             self.inodes.clear_migration_info();
         }
         result
+    }
+
+    fn serialize(&self, mut state_pipe: File) -> io::Result<()> {
+        self.track_migration_info.store(false, Ordering::Relaxed);
+
+        let state = serialized::PassthroughFs::V1(self.try_into()?);
+        self.inodes.clear_migration_info();
+        let serialized: Vec<u8> = state.try_into()?;
+        state_pipe.write_all(&serialized)?;
+        Ok(())
     }
 }

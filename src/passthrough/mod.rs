@@ -60,7 +60,6 @@ struct HandleData {
     // On migration, must be set when we serialize our internal state to send it to the
     // destination.  As long as `HandleMigrationInfo::new()` is cheap, we may as well
     // keep it always set.
-    #[allow(dead_code)] // will be used once serialization is implemented
     migration_info: HandleMigrationInfo,
 }
 
