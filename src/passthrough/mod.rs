@@ -1197,6 +1197,12 @@ impl FileSystem for PassthroughFs {
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         self.open_root_node()?;
 
+        // Note: On migration, all options negotiated here with the guest must be sent to the
+        // destination in the `device_state::serialized::NegotiatedOpts` structure.  So when adding
+        // a new option here, don't forget to add it there, too, and handle it both in
+        // `<serialized::NegotiatedOpts as From<&PassthroughFs>>::from()` and
+        // `serialized::NegotiatedOpts::apply()`.
+
         let mut opts = if self.cfg.readdirplus {
             FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO
         } else {
