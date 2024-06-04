@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Error, ErrorKind, Write};
+use std::io::{Error, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
@@ -98,10 +98,7 @@ pub fn sfork() -> io::Result<i32> {
         }
         if num_fds != 0 {
             // The original parent died
-            return Err(Error::new(
-                ErrorKind::Other,
-                "Parent process died unexpectedly",
-            ));
+            return Err(other_io_error("Parent process died unexpectedly"));
         }
     }
     Ok(child_pid)
@@ -161,4 +158,33 @@ pub fn add_cap_to_eff(cap_name: &str) -> capng::Result<()> {
     capng::apply(Set::CAPS)?;
 
     Ok(())
+}
+
+/// Same as `io::Error::other()`, but the respective io_error_other feature has only been
+/// stabilized in Rust 1.74.0, which is too new for our intended targets.
+pub fn other_io_error<E: Into<Box<dyn std::error::Error + Send + Sync>>>(err: E) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, err)
+}
+
+/// Trait for `Error` object that allows prepending the error message by something that gives
+/// context
+pub trait ErrorContext {
+    fn context<C: std::fmt::Display>(self, context: C) -> Self;
+}
+
+impl ErrorContext for io::Error {
+    fn context<C: std::fmt::Display>(self, context: C) -> Self {
+        io::Error::new(self.kind(), format!("{context}: {self}"))
+    }
+}
+
+/// Lifts the `ErrorContext` trait to `Result` types
+pub trait ResultErrorContext {
+    fn err_context<C: std::fmt::Display, F: FnOnce() -> C>(self, context: F) -> Self;
+}
+
+impl<V, E: ErrorContext> ResultErrorContext for Result<V, E> {
+    fn err_context<C: std::fmt::Display, F: FnOnce() -> C>(self, context: F) -> Self {
+        self.map_err(|err| err.context(context()))
+    }
 }

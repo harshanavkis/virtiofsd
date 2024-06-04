@@ -217,7 +217,7 @@ mod filehandle {
     pub struct CFileHandle {
         handle_bytes: libc::c_uint,
         handle_type: libc::c_int,
-        f_handle: [libc::c_char; MAX_HANDLE_SZ],
+        f_handle: [u8; MAX_HANDLE_SZ],
     }
 
     impl Default for CFileHandle {
@@ -227,6 +227,16 @@ mod filehandle {
                 handle_type: 0,
                 f_handle: [0; MAX_HANDLE_SZ],
             }
+        }
+    }
+
+    impl CFileHandle {
+        pub fn as_bytes(&self) -> &[u8] {
+            &self.f_handle[..(self.handle_bytes as usize)]
+        }
+
+        pub fn handle_type(&self) -> libc::c_int {
+            self.handle_type
         }
     }
 

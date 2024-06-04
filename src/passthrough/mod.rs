@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 pub mod credentials;
+pub mod device_state;
 pub mod file_handle;
 pub mod inode_store;
 pub mod mount_fd;
@@ -16,7 +17,10 @@ use crate::filesystem::{
     SecContext, SetattrValid, SetxattrFlags, ZeroCopyReader, ZeroCopyWriter,
 };
 use crate::passthrough::credentials::{drop_effective_cap, UnixCredentials};
-use crate::passthrough::inode_store::{Inode, InodeData, InodeFile, InodeIds, InodeStore};
+use crate::passthrough::device_state::preserialization::{HandleMigrationInfo, InodeMigrationInfo};
+use crate::passthrough::inode_store::{
+    Inode, InodeData, InodeFile, InodeIds, InodeStore, StrongInodeReference,
+};
 use crate::passthrough::util::{ebadf, is_safe_inode, openat, reopen_fd_through_proc};
 use crate::read_dir::ReadDir;
 use crate::{fuse, oslib};
@@ -33,7 +37,7 @@ use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use xattrmap::{AppliedRule, XattrMap};
 
@@ -41,9 +45,21 @@ const EMPTY_CSTR: &[u8] = b"\0";
 
 type Handle = u64;
 
+enum HandleDataFile {
+    File(RwLock<File>),
+    // `io::Error` does not implement `Clone`, so without wrapping it in `Arc`, returning the error
+    // anywhere would be impossible without consuming it
+    Invalid(Arc<io::Error>),
+}
+
 struct HandleData {
     inode: Inode,
-    file: RwLock<File>,
+    file: HandleDataFile,
+
+    // On migration, must be set when we serialize our internal state to send it to the
+    // destination.  As long as `HandleMigrationInfo::new()` is cheap, we may as well
+    // keep it always set.
+    migration_info: HandleMigrationInfo,
 }
 
 struct ScopedWorkingDirectory {
@@ -125,6 +141,53 @@ pub enum InodeFileHandlesMode {
 
     /// Always use file handles, never fall back to `O_PATH` file descriptors.
     Mandatory,
+}
+
+/// What to do when an error occurs during migration (checked on the migration destination)
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MigrationOnError {
+    /// Whenever any failure occurs, return a hard error to the vhost-user front-end (e.g.  QEMU),
+    /// aborting migration.
+    #[default]
+    Abort,
+
+    /// Let migration finish, but the guest will be unable to access any of the files that were
+    /// failed to be found/opened, receiving only errors.
+    GuestError,
+}
+
+impl FromStr for MigrationOnError {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "abort" => Ok(MigrationOnError::Abort),
+            "guest-error" => Ok(MigrationOnError::GuestError),
+
+            _ => Err("invalid migration-on-error value"),
+        }
+    }
+}
+
+/// How to migrate our internal state to the destination instance
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MigrationMode {
+    /// Iterate through the shared directory to find paths for all inodes indexed and opened by the
+    /// guest, and transfer these paths to the destination.
+    #[default]
+    FindPaths,
+}
+
+impl FromStr for MigrationMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "find-paths" => Ok(MigrationMode::FindPaths),
+
+            _ => Err("invalid migration-mode value"),
+        }
+    }
 }
 
 /// Options that configure the behavior of the file system.
@@ -268,6 +331,30 @@ pub struct Config {
     ///
     /// The default is `false`.
     pub allow_mmap: bool,
+
+    /// Defines what happens when restoring our internal state on the destination fails.
+    ///
+    /// The default is `Abort`.
+    pub migration_on_error: MigrationOnError,
+
+    /// Whether to store a file handle for each inode in the migration stream, alongside the
+    /// information on how to find the inode.  The destination must generate the file handle for
+    /// the inode it has opened and verify they match.
+    ///
+    /// The default is `false`.
+    pub migration_verify_handles: bool,
+
+    /// Whether to confirm (for path-based migration) at serialization (during switch-over) whether
+    /// the paths still match the inodes they are supposed to represent, and if they do not, try to
+    /// correct the path via the respective symlink in /proc/self/fd.
+    ///
+    /// The default is `false`.
+    pub migration_confirm_paths: bool,
+
+    /// Defines how to migrate our internal state to the destination instance.
+    ///
+    /// The default is `FindPaths`.
+    pub migration_mode: MigrationMode,
 }
 
 impl Default for Config {
@@ -293,6 +380,10 @@ impl Default for Config {
             security_label: false,
             clean_noatime: true,
             allow_mmap: false,
+            migration_on_error: MigrationOnError::Abort,
+            migration_verify_handles: false,
+            migration_confirm_paths: false,
+            migration_mode: MigrationMode::FindPaths,
         }
     }
 }
@@ -307,7 +398,7 @@ pub struct PassthroughFs {
     // the `O_PATH` option so they cannot be used for reading or writing any data. See the
     // documentation of the `O_PATH` flag in `open(2)` for more details on what one can and cannot
     // do with an fd opened with this flag.
-    inodes: RwLock<InodeStore>,
+    inodes: InodeStore,
     next_inode: AtomicU64,
 
     // File descriptors for open files and directories. Unlike the fds in `inodes`, these _can_ be
@@ -346,6 +437,10 @@ pub struct PassthroughFs {
     // Whether the guest kernel supports the supplementary group extension.
     sup_group_extension: AtomicBool,
 
+    // Whether we are preparing for migration and need to track changes to inodes like renames.  We
+    // should then also make sure newly created inodes immediately have their migration info set.
+    track_migration_info: AtomicBool,
+
     cfg: Config,
 }
 
@@ -383,7 +478,7 @@ impl PassthroughFs {
         };
 
         let mut fs = PassthroughFs {
-            inodes: RwLock::new(Default::default()),
+            inodes: Default::default(),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 1),
             handles: RwLock::new(BTreeMap::new()),
             next_handle: AtomicU64::new(0),
@@ -395,6 +490,7 @@ impl PassthroughFs {
             posix_acl: AtomicBool::new(false),
             sup_group_extension: AtomicBool::new(false),
             os_facts: oslib::OsFacts::new(),
+            track_migration_info: AtomicBool::new(false),
             cfg,
         };
 
@@ -448,13 +544,7 @@ impl PassthroughFs {
     }
 
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.inodes.get(inode).ok_or_else(ebadf)?;
 
         // When writeback caching is enabled, the kernel may send read requests even if the
         // userspace program opened the file write-only. So we need to ensure that we have opened
@@ -637,16 +727,25 @@ impl PassthroughFs {
         Ok(())
     }
 
-    fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        let p = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        let p_file = p.get_file()?;
+    /// Try to look up an inode by its `name` relative to the given `parent` inode.  If the inode
+    /// is registered in our inode store (`self.inodes`), return a strong reference to it.
+    /// Otherwise, return `None` instead.
+    /// Along with the inode (or `None`), return information gathered along the way: An `O_PATH`
+    /// file to the inode, stat information, and optionally a file handle if virtiofsd has been
+    /// configured to use file handles.
+    /// Return an error if the parent node cannot be opened, the given inode cannot be found on the
+    /// filesystem, or generating the stat information or file handle fails.
+    fn try_lookup_implementation(
+        &self,
+        parent_data: &InodeData,
+        name: &CStr,
+    ) -> io::Result<(
+        Option<StrongInodeReference>,
+        File,
+        StatExt,
+        Option<FileHandle>,
+    )> {
+        let p_file = parent_data.get_file()?;
 
         let path_fd = {
             let fd = self.open_relative_to(&p_file, name, libc::O_PATH, None)?;
@@ -661,6 +760,38 @@ impl PassthroughFs {
         // `cfg.inode_file_handles` is `Never`, we do not need it anyway.
         let handle = self.get_file_handle_opt(&path_fd, &st)?;
 
+        let ids = InodeIds {
+            ino: st.st.st_ino,
+            dev: st.st.st_dev,
+            mnt_id: st.mnt_id,
+        };
+
+        Ok((
+            self.inodes.claim_inode(handle.as_ref(), &ids).ok(),
+            path_fd,
+            st,
+            handle,
+        ))
+    }
+
+    /// Try to look up an inode by its `name` relative to the parent inode given by its
+    /// `parent_data`.  If the inode is registered in our inode store (`self.inodes`), return a
+    /// strong reference to it.  Otherwise, return `None`.
+    /// Return an error if the parent node cannot be opened, the given inode cannot be found on the
+    /// filesystem, or generating the Stat information or file handle fails.
+    fn try_lookup(
+        &self,
+        parent_data: &InodeData,
+        name: &CStr,
+    ) -> io::Result<Option<StrongInodeReference>> {
+        self.try_lookup_implementation(parent_data, name)
+            .map(|result| result.0)
+    }
+
+    fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        let p = self.inodes.get(parent).ok_or_else(ebadf)?;
+        let (existing_inode, path_fd, st, handle) = self.try_lookup_implementation(&p, name)?;
+
         let mut attr_flags: u32 = 0;
 
         if st.st.st_mode & libc::S_IFMT == libc::S_IFDIR
@@ -669,14 +800,6 @@ impl PassthroughFs {
         {
             attr_flags |= fuse::ATTR_SUBMOUNT;
         }
-
-        let ids = InodeIds {
-            ino: st.st.st_ino,
-            dev: st.st.st_dev,
-            mnt_id: st.mnt_id,
-        };
-
-        let existing_inode = Self::claim_inode(&self.inodes.read().unwrap(), handle.as_ref(), &ids);
 
         let inode = if let Some(inode) = existing_inode {
             inode
@@ -687,83 +810,44 @@ impl PassthroughFs {
                 FileOrHandle::File(path_fd)
             };
 
-            // There is a possible race here where two (or more) threads end up creating an inode
-            // ID.  However, only the one in the thread that locks `self.inodes` first will be used
-            // and the others are wasted.
-            let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
-            let mut inodes = self.inodes.write().unwrap();
-
-            if let Some(inode) = Self::claim_inode(&inodes, handle.as_ref(), &ids) {
-                // An inode was added concurrently while we did not hold a lock on `self.inodes`, so
-                // we use that instead.  `file_or_handle` will be dropped.
-                inode
+            let mig_info = if self.track_migration_info.load(Ordering::Relaxed) {
+                let parent_strong_ref = StrongInodeReference::new_with_data(p, &self.inodes)?;
+                Some(InodeMigrationInfo::new(
+                    &self.cfg,
+                    parent_strong_ref,
+                    name,
+                    &file_or_handle,
+                )?)
             } else {
-                inodes.insert(Arc::new(InodeData {
-                    inode,
-                    file_or_handle,
-                    refcount: AtomicU64::new(1),
-                    ids,
-                    mode: st.st.st_mode,
-                }));
+                None
+            };
 
-                inode
-            }
+            let inode_data = InodeData {
+                inode: self.next_inode.fetch_add(1, Ordering::Relaxed),
+                file_or_handle,
+                refcount: AtomicU64::new(1),
+                ids: InodeIds {
+                    ino: st.st.st_ino,
+                    dev: st.st.st_dev,
+                    mnt_id: st.mnt_id,
+                },
+                mode: st.st.st_mode,
+                migration_info: Mutex::new(mig_info),
+            };
+            self.inodes.get_or_insert(inode_data)?
         };
 
         Ok(Entry {
-            inode,
+            // By leaking, we transfer ownership of this refcount to the guest.  That is safe,
+            // because the guest is expected to explicitly release its reference and decrement the
+            // refcount via `FORGET` later.
+            inode: unsafe { inode.leak() },
             generation: 0,
             attr: st.st,
             attr_flags,
             attr_timeout: self.cfg.attr_timeout,
             entry_timeout: self.cfg.entry_timeout,
         })
-    }
-
-    /// Attempts to get an inode from `inodes` and increment its refcount.  Returns the inode
-    /// number on success and `None` on failure.  Reasons for failure can be that the inode isn't
-    /// in the map or that the refcount is zero.  This function will never increment a refcount
-    /// that's already zero.
-    fn claim_inode(
-        inodes: &InodeStore,
-        handle: Option<&FileHandle>,
-        ids: &InodeIds,
-    ) -> Option<Inode> {
-        let data = handle.and_then(|h| inodes.get_by_handle(h)).or_else(|| {
-            inodes.get_by_ids(ids).filter(|data| {
-                // When we have to fall back to looking up an inode by its inode ID, ensure
-                // that we hit an entry that has a valid file descriptor.  Having an FD
-                // open means that the inode cannot really be deleted until the FD is
-                // closed, so that the inode ID remains valid until we evict the
-                // `InodeData`.  With no FD open (and just a file handle), the inode can be
-                // deleted while we still have our `InodeData`, and so the inode ID may be
-                // reused by a completely different new inode.  Such inodes must be looked
-                // up by file handle, because this handle contains a generation ID to
-                // differentiate between the old and the new inode.
-                matches!(data.file_or_handle, FileOrHandle::File(_))
-            })
-        });
-        if let Some(data) = data {
-            // We use a CAS loop instead of `fetch_add()`, because we must never increment the
-            // refcount from zero to one.
-            let mut n = data.refcount.load(Ordering::Relaxed);
-            loop {
-                if n == 0 {
-                    return None;
-                }
-
-                match data.refcount.compare_exchange_weak(
-                    n,
-                    n + 1,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return Some(data.inode),
-                    Err(old) => n = old,
-                }
-            }
-        }
-        None
     }
 
     fn do_open(
@@ -783,22 +867,25 @@ impl PassthroughFs {
             flags &= !(libc::O_NOATIME as u32)
         }
 
-        let file = RwLock::new({
+        let file = {
             let _killpriv_guard = if self.cfg.killpriv_v2 && kill_priv {
                 drop_effective_cap("FSETID")?
             } else {
                 None
             };
             self.open_inode(inode, flags as i32)?
-        });
+        };
 
         if flags & (libc::O_TRUNC as u32) != 0 {
-            let file = file.read().expect("poisoned lock");
             self.clear_file_capabilities(file.as_raw_fd(), false)?;
         }
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let data = HandleData { inode, file };
+        let data = HandleData {
+            inode,
+            file: file.into(),
+            migration_info: HandleMigrationInfo::new(flags as i32),
+        };
 
         self.handles.write().unwrap().insert(handle, Arc::new(data));
 
@@ -844,14 +931,7 @@ impl PassthroughFs {
     }
 
     fn do_getattr(&self, inode: Inode) -> io::Result<(libc::stat64, Duration)> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
+        let data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let inode_file = data.get_file()?;
         let st = statx(&inode_file, None)?.st;
 
@@ -859,14 +939,7 @@ impl PassthroughFs {
     }
 
     fn do_unlink(&self, parent: Inode, name: &CStr, flags: libc::c_int) -> io::Result<()> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
+        let data = self.inodes.get(parent).ok_or_else(ebadf)?;
         let parent_file = data.get_file()?;
 
         // Safe because this doesn't modify any memory and we check the return value.
@@ -1084,51 +1157,8 @@ impl PassthroughFs {
             Err(res_err)
         }
     }
-}
 
-fn forget_one(inodes: &mut InodeStore, inode: Inode, count: u64) {
-    if let Some(data) = inodes.get(&inode) {
-        // Acquiring the write lock on the inode map prevents new lookups from incrementing the
-        // refcount but there is the possibility that a previous lookup already acquired a
-        // reference to the inode data and is in the process of updating the refcount so we need
-        // to loop here until we can decrement successfully.
-        loop {
-            let refcount = data.refcount.load(Ordering::Relaxed);
-
-            // Saturating sub because it doesn't make sense for a refcount to go below zero and
-            // we don't want misbehaving clients to cause integer overflow.
-            let new_count = refcount.saturating_sub(count);
-
-            // We don't need any stronger ordering, because the refcount itself doesn't protect any
-            // data.  The `inodes` map is protected since we hold an exclusive reference (obtained
-            // from an `RwLock`).
-            if data.refcount.compare_exchange(
-                refcount,
-                new_count,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) == Ok(refcount)
-            {
-                if new_count == 0 {
-                    // We just removed the last refcount for this inode. There's no need for an
-                    // acquire fence here because we hold a write lock on the inode map and any
-                    // thread that is waiting to do a forget on the same inode will have to wait
-                    // until we release the lock. So there's is no other release store for us to
-                    // synchronize with before deleting the entry.
-                    inodes.remove(&inode);
-                }
-                break;
-            }
-        }
-    }
-}
-
-impl FileSystem for PassthroughFs {
-    type Inode = Inode;
-    type Handle = Handle;
-    type DirIter = ReadDir<Vec<u8>>;
-
-    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+    pub fn open_root_node(&self) -> io::Result<()> {
         // We use `O_PATH` because we just want this for traversing the directory tree
         // and not for actually reading the contents. We don't use `open_relative_to()`
         // here because we are not opening a guest-provided pathname. Also, `self.cfg.root_dir`
@@ -1149,10 +1179,8 @@ impl FileSystem for PassthroughFs {
             FileOrHandle::File(path_fd)
         };
 
-        let mut inodes = self.inodes.write().unwrap();
-
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
-        inodes.insert(Arc::new(InodeData {
+        let inode = InodeData {
             inode: fuse::ROOT_ID,
             file_or_handle,
             refcount: AtomicU64::new(2),
@@ -1162,7 +1190,53 @@ impl FileSystem for PassthroughFs {
                 mnt_id: st.mnt_id,
             },
             mode: st.st.st_mode,
-        }));
+            migration_info: Mutex::new(None),
+        };
+        self.inodes.new_inode(inode)?;
+        Ok(())
+    }
+
+    /// After renaming an inode while preparing for migration, update its migration info if
+    /// necessary.  For example, when representing inodes through their filename and parent
+    /// directory node, these must be updated to match the new name and location.
+    /// `parent` and `filename` are the inode's new location.
+    fn update_inode_migration_info(
+        &self,
+        parent_data: Arc<InodeData>,
+        filename: &CStr,
+    ) -> io::Result<()> {
+        // We only need to update the node's migration info if we have it in our store
+        if let Some(inode) = self.try_lookup(&parent_data, filename)? {
+            let inode_data = inode.get();
+            let parent_strong_ref = StrongInodeReference::new_with_data(parent_data, &self.inodes)?;
+            let mut info_locked = inode_data.migration_info.lock().unwrap();
+            // Unconditionally clear any potentially existing path, because it will be outdated
+            info_locked.take();
+            *info_locked = Some(InodeMigrationInfo::new(
+                &self.cfg,
+                parent_strong_ref,
+                filename,
+                &inode_data.file_or_handle,
+            )?);
+        }
+
+        Ok(())
+    }
+}
+
+impl FileSystem for PassthroughFs {
+    type Inode = Inode;
+    type Handle = Handle;
+    type DirIter = ReadDir<Vec<u8>>;
+
+    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        self.open_root_node()?;
+
+        // Note: On migration, all options negotiated here with the guest must be sent to the
+        // destination in the `device_state::serialized::NegotiatedOpts` structure.  So when adding
+        // a new option here, don't forget to add it there, too, and handle it both in
+        // `<serialized::NegotiatedOpts as From<&PassthroughFs>>::from()` and
+        // `serialized::NegotiatedOpts::apply()`.
 
         let mut opts = if self.cfg.readdirplus {
             FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO
@@ -1222,7 +1296,7 @@ impl FileSystem for PassthroughFs {
 
     fn destroy(&self) {
         self.handles.write().unwrap().clear();
-        self.inodes.write().unwrap().clear();
+        self.inodes.clear();
         self.writeback.store(false, Ordering::Relaxed);
         self.announce_submounts.store(false, Ordering::Relaxed);
         self.posix_acl.store(false, Ordering::Relaxed);
@@ -1230,14 +1304,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<libc::statvfs64> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
+        let data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let inode_file = data.get_file()?;
         let mut out = MaybeUninit::<libc::statvfs64>::zeroed();
 
@@ -1256,17 +1323,11 @@ impl FileSystem for PassthroughFs {
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
-        let mut inodes = self.inodes.write().unwrap();
-
-        forget_one(&mut inodes, inode, count)
+        self.inodes.forget_one(inode, count)
     }
 
     fn batch_forget(&self, _ctx: Context, requests: Vec<(Inode, u64)>) {
-        let mut inodes = self.inodes.write().unwrap();
-
-        for (inode, count) in requests {
-            forget_one(&mut inodes, inode, count)
-        }
+        self.inodes.forget_many(requests)
     }
 
     fn opendir(
@@ -1297,14 +1358,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
+        let data = self.inodes.get(parent).ok_or_else(ebadf)?;
         let parent_file = data.get_file()?;
 
         let res = {
@@ -1362,7 +1416,7 @@ impl FileSystem for PassthroughFs {
         // lock for both the `lseek64` and `getdents64` syscalls to ensure that no other
         // thread changes the kernel offset while we are using it.
         #[allow(clippy::readonly_write_lock)]
-        let dir = data.file.write().unwrap();
+        let dir = data.file.get()?.write().unwrap();
 
         ReadDir::new(&*dir, offset as libc::off64_t, buf)
     }
@@ -1401,14 +1455,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
+        let data = self.inodes.get(parent).ok_or_else(ebadf)?;
         let parent_file = data.get_file()?;
 
         // We need to clean the `O_APPEND` flag in case the file is mem mapped or if the flag
@@ -1445,14 +1492,15 @@ impl FileSystem for PassthroughFs {
             }
             Ok(fd) => {
                 // Safe because we just opened this fd.
-                let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
+                let file = unsafe { File::from_raw_fd(fd) };
 
                 let entry = self.do_lookup(parent, name)?;
 
                 let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
                 let data = HandleData {
                     inode: entry.inode,
-                    file,
+                    file: file.into(),
+                    migration_info: HandleMigrationInfo::new(flags as i32),
                 };
 
                 self.handles.write().unwrap().insert(handle, Arc::new(data));
@@ -1526,7 +1574,7 @@ impl FileSystem for PassthroughFs {
 
         // This is safe because write_from uses preadv64, so the underlying file descriptor
         // offset is not affected by this operation.
-        let f = data.file.read().unwrap();
+        let f = data.file.get()?.read().unwrap();
         w.write_from(&f, size as usize, offset)
     }
 
@@ -1547,7 +1595,7 @@ impl FileSystem for PassthroughFs {
 
         // This is safe because read_to uses `pwritev2(2)`, so the underlying file descriptor
         // offset is not affected by this operation.
-        let f = data.file.read().unwrap();
+        let f = data.file.get()?.read().unwrap();
 
         {
             let _killpriv_guard = if self.cfg.killpriv_v2 && kill_priv {
@@ -1590,13 +1638,7 @@ impl FileSystem for PassthroughFs {
         handle: Option<Handle>,
         valid: SetattrValid,
     ) -> io::Result<(libc::stat64, Duration)> {
-        let inode_data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let inode_data = self.inodes.get(inode).ok_or_else(ebadf)?;
 
         // In this case, we need to open a new O_RDWR FD
         let rdwr_inode_file = handle.is_none() && valid.intersects(SetattrValid::SIZE);
@@ -1617,7 +1659,7 @@ impl FileSystem for PassthroughFs {
         let data = if let Some(handle) = handle {
             let hd = self.find_handle(handle, inode)?;
 
-            let fd = hd.file.write().unwrap().as_raw_fd();
+            let fd = hd.file.get()?.write().unwrap().as_raw_fd();
             Data::Handle(hd, fd)
         } else {
             let pathname = CString::new(format!("{}", inode_file.as_raw_fd()))
@@ -1750,20 +1792,8 @@ impl FileSystem for PassthroughFs {
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
-        let old_inode = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&olddir)
-            .cloned()
-            .ok_or_else(ebadf)?;
-        let new_inode = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&newdir)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let old_inode = self.inodes.get(olddir).ok_or_else(ebadf)?;
+        let new_inode = self.inodes.get(newdir).ok_or_else(ebadf)?;
 
         let old_file = old_inode.get_file()?;
         let new_file = new_inode.get_file()?;
@@ -1781,11 +1811,22 @@ impl FileSystem for PassthroughFs {
                 flags,
             )
         };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        if res != 0 {
+            return Err(io::Error::last_os_error());
         }
+
+        if self.track_migration_info.load(Ordering::Relaxed) {
+            // When preparing for migration, we need to tell the migration code that this node has
+            // been renamed, which might need to be reflected in the migration info
+            if let Err(err) = self.update_inode_migration_info(new_inode, newname) {
+                warn!(
+                    "Failed to update renamed file's ({oldname:?} -> {newname:?}) migration info, \
+                    the migration destination may be unable to find it: {err}",
+                );
+            }
+        }
+
+        Ok(())
     }
 
     fn mknod(
@@ -1798,14 +1839,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
+        let data = self.inodes.get(parent).ok_or_else(ebadf)?;
         let parent_file = data.get_file()?;
 
         let res = {
@@ -1854,20 +1888,8 @@ impl FileSystem for PassthroughFs {
         newparent: Inode,
         newname: &CStr,
     ) -> io::Result<Entry> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-        let new_inode = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&newparent)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.inodes.get(inode).ok_or_else(ebadf)?;
+        let new_inode = self.inodes.get(newparent).ok_or_else(ebadf)?;
 
         let inode_file = data.get_file()?;
         let newparent_file = new_inode.get_file()?;
@@ -1900,14 +1922,7 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
+        let data = self.inodes.get(parent).ok_or_else(ebadf)?;
         let parent_file = data.get_file()?;
 
         let res = {
@@ -1940,14 +1955,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
+        let data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let inode_file = data.get_file()?;
 
         let mut buf = vec![0; libc::PATH_MAX as usize];
@@ -1985,7 +1993,7 @@ impl FileSystem for PassthroughFs {
         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
         // because this doesn't modify any memory and we check the return values.
         unsafe {
-            let newfd = libc::dup(data.file.write().unwrap().as_raw_fd());
+            let newfd = libc::dup(data.file.get()?.write().unwrap().as_raw_fd());
             if newfd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -2001,7 +2009,7 @@ impl FileSystem for PassthroughFs {
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
         let data = self.find_handle(handle, inode)?;
 
-        let fd = data.file.write().unwrap().as_raw_fd();
+        let fd = data.file.get()?.write().unwrap().as_raw_fd();
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
@@ -2030,14 +2038,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
+        let data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let inode_file = data.get_file()?;
         let st = statx(&inode_file, None)?.st;
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
@@ -2092,14 +2093,7 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
 
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
+        let data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let name = self.map_client_xattrname(name)?;
 
         // If we are setting posix access acl and if SGID needs to be
@@ -2203,13 +2197,7 @@ impl FileSystem for PassthroughFs {
             }
         })?;
 
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.inodes.get(inode).ok_or_else(ebadf)?;
 
         let res = if is_safe_inode(data.mode) {
             // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
@@ -2261,14 +2249,7 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
 
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
+        let data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let mut buf = vec![0; size as usize];
 
         let res = if is_safe_inode(data.mode) {
@@ -2320,14 +2301,7 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
 
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
+        let data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let name = self.map_client_xattrname(name)?;
 
         let res = if is_safe_inode(data.mode) {
@@ -2368,7 +2342,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<()> {
         let data = self.find_handle(handle, inode)?;
 
-        let fd = data.file.write().unwrap().as_raw_fd();
+        let fd = data.file.get()?.write().unwrap().as_raw_fd();
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe {
             libc::fallocate64(
@@ -2395,7 +2369,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<u64> {
         let data = self.find_handle(handle, inode)?;
 
-        let fd = data.file.write().unwrap().as_raw_fd();
+        let fd = data.file.get()?.write().unwrap().as_raw_fd();
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::lseek(fd, offset as libc::off64_t, whence as libc::c_int) };
@@ -2421,12 +2395,12 @@ impl FileSystem for PassthroughFs {
         let data_in = self.find_handle(handle_in, inode_in)?;
 
         // Take just a read lock as we're not going to alter the file descriptor offset.
-        let fd_in = data_in.file.read().unwrap().as_raw_fd();
+        let fd_in = data_in.file.get()?.read().unwrap().as_raw_fd();
 
         let data_out = self.find_handle(handle_out, inode_out)?;
 
         // Take just a read lock as we're not going to alter the file descriptor offset.
-        let fd_out = data_out.file.read().unwrap().as_raw_fd();
+        let fd_out = data_out.file.get()?.read().unwrap().as_raw_fd();
 
         // Safe because this will only modify `offset_in` and `offset_out` and we check
         // the return value.
@@ -2461,5 +2435,20 @@ impl FileSystem for PassthroughFs {
         } else {
             Ok(())
         }
+    }
+}
+
+impl HandleDataFile {
+    fn get(&self) -> io::Result<&'_ RwLock<File>> {
+        match self {
+            HandleDataFile::File(file) => Ok(file),
+            HandleDataFile::Invalid(err) => Err(io::Error::new(err.kind(), Arc::clone(err))),
+        }
+    }
+}
+
+impl From<File> for HandleDataFile {
+    fn from(file: File) -> Self {
+        HandleDataFile::File(RwLock::new(file))
     }
 }

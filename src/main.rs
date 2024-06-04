@@ -9,10 +9,13 @@ use passthrough::xattrmap::XattrMap;
 use std::collections::HashSet;
 use std::convert::{self, TryFrom, TryInto};
 use std::ffi::CString;
+use std::fs::File;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::{env, error, fmt, io, process};
 use virtiofsd::idmap::{GidMap, UidMap};
@@ -22,6 +25,7 @@ use clap::{CommandFactory, Parser};
 use vhost::vhost_user::message::*;
 use vhost::vhost_user::Error::Disconnected;
 use vhost::vhost_user::{Backend, Listener};
+use vhost_user_backend::bitmap::BitmapMmapRegion;
 use vhost_user_backend::Error::HandleRequest;
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringMutex, VringState, VringT};
 use virtio_bindings::bindings::virtio_config::*;
@@ -30,12 +34,14 @@ use virtio_bindings::bindings::virtio_ring::{
 };
 use virtio_queue::{DescriptorChain, QueueOwnedT};
 use virtiofsd::descriptor_utils::{Error as VufDescriptorError, Reader, Writer};
-use virtiofsd::filesystem::FileSystem;
-use virtiofsd::passthrough::{self, CachePolicy, InodeFileHandlesMode, PassthroughFs};
+use virtiofsd::filesystem::{FileSystem, SerializableFileSystem};
+use virtiofsd::passthrough::{
+    self, CachePolicy, InodeFileHandlesMode, MigrationMode, MigrationOnError, PassthroughFs,
+};
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
 use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
 use virtiofsd::server::Server;
-use virtiofsd::util::write_pid_file;
+use virtiofsd::util::{other_io_error, write_pid_file};
 use virtiofsd::{limits, oslib, Error as VhostUserFsError};
 use vm_memory::{
     ByteValued, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap, Le32,
@@ -50,6 +56,9 @@ const REQUEST_QUEUES: u32 = 1;
 // Since VIRTIO_FS_F_NOTIFICATION is not advertised we do not have a
 // notification queue.
 const NUM_QUEUES: usize = REQUEST_QUEUES as usize + 1;
+
+type LoggedMemory = GuestMemoryMmap<BitmapMmapRegion>;
+type LoggedMemoryAtomic = GuestMemoryAtomic<LoggedMemory>;
 
 // The guest queued an available buffer for the high priority queue.
 const HIPRIO_QUEUE_EVENT: u16 = 0;
@@ -115,12 +124,12 @@ impl error::Error for Error {}
 
 impl convert::From<Error> for io::Error {
     fn from(e: Error) -> Self {
-        io::Error::new(io::ErrorKind::Other, e)
+        other_io_error(e)
     }
 }
 
 struct VhostUserFsThread<F: FileSystem + Send + Sync + 'static> {
-    mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    mem: Option<LoggedMemoryAtomic>,
     kill_evt: EventFd,
     server: Arc<Server<F>>,
     // handle request from backend to frontend
@@ -142,7 +151,7 @@ impl<F: FileSystem + Send + Sync + 'static> Clone for VhostUserFsThread<F> {
     }
 }
 
-impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
+impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
     fn new(fs: F, thread_pool_size: usize) -> Result<Self> {
         let pool = if thread_pool_size > 0 {
             // Test that unshare(CLONE_FS) works, it will be called for each thread.
@@ -182,7 +191,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
     }
 
     fn return_descriptor(
-        vring_state: &mut VringState,
+        vring_state: &mut VringState<LoggedMemoryAtomic>,
         head_index: u16,
         event_idx: bool,
         len: usize,
@@ -213,7 +222,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
         }
     }
 
-    fn process_queue_pool(&self, vring: VringMutex) -> Result<bool> {
+    fn process_queue_pool(&self, vring: VringMutex<LoggedMemoryAtomic>) -> Result<bool> {
         let mut used_any = false;
         let atomic_mem = match &self.mem {
             Some(m) => m,
@@ -260,7 +269,10 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
         Ok(used_any)
     }
 
-    fn process_queue_serial(&self, vring_state: &mut VringState) -> Result<bool> {
+    fn process_queue_serial(
+        &self,
+        vring_state: &mut VringState<LoggedMemoryAtomic>,
+    ) -> Result<bool> {
         let mut used_any = false;
         let mem = match &self.mem {
             Some(m) => m.memory(),
@@ -268,7 +280,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
         };
         let mut vu_req = self.vu_req.clone();
 
-        let avail_chains: Vec<DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap>>> = vring_state
+        let avail_chains: Vec<DescriptorChain<GuestMemoryLoadGuard<LoggedMemory>>> = vring_state
             .get_queue_mut()
             .iter(mem.clone())
             .map_err(|_| Error::IterateQueue)?
@@ -301,7 +313,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
     fn handle_event_pool(
         &self,
         device_event: u16,
-        vrings: &[VringMutex],
+        vrings: &[VringMutex<LoggedMemoryAtomic>],
     ) -> VhostUserBackendResult<()> {
         let idx = match device_event {
             HIPRIO_QUEUE_EVENT => {
@@ -338,7 +350,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
     fn handle_event_serial(
         &self,
         device_event: u16,
-        vrings: &[VringMutex],
+        vrings: &[VringMutex<LoggedMemoryAtomic>],
     ) -> VhostUserBackendResult<()> {
         let mut vring_state = match device_event {
             HIPRIO_QUEUE_EVENT => {
@@ -393,21 +405,35 @@ impl Default for VirtioFsConfig {
 
 unsafe impl ByteValued for VirtioFsConfig {}
 
-struct VhostUserFsBackend<F: FileSystem + Send + Sync + 'static> {
+struct PremigrationThread {
+    handle: JoinHandle<io::Result<()>>,
+    cancel: Arc<AtomicBool>,
+}
+
+struct VhostUserFsBackend<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> {
     thread: RwLock<VhostUserFsThread<F>>,
+    premigration_thread: Mutex<Option<PremigrationThread>>,
+    migration_thread: Mutex<Option<JoinHandle<io::Result<()>>>>,
     tag: Option<String>,
 }
 
-impl<F: FileSystem + Send + Sync + 'static> VhostUserFsBackend<F> {
+impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFsBackend<F> {
     fn new(fs: F, thread_pool_size: usize, tag: Option<String>) -> Result<Self> {
         let thread = RwLock::new(VhostUserFsThread::new(fs, thread_pool_size)?);
-        Ok(VhostUserFsBackend { thread, tag })
+        Ok(VhostUserFsBackend {
+            thread,
+            premigration_thread: None.into(),
+            migration_thread: None.into(),
+            tag,
+        })
     }
 }
 
-impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBackend<F> {
-    type Bitmap = ();
-    type Vring = VringMutex;
+impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserBackend
+    for VhostUserFsBackend<F>
+{
+    type Bitmap = BitmapMmapRegion;
+    type Vring = VringMutex<LoggedMemoryAtomic>;
 
     fn num_queues(&self) -> usize {
         NUM_QUEUES
@@ -422,6 +448,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
             | 1 << VIRTIO_RING_F_INDIRECT_DESC
             | 1 << VIRTIO_RING_F_EVENT_IDX
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
+            | VhostUserVirtioFeatures::LOG_ALL.bits()
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
@@ -429,7 +456,9 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
             | VhostUserProtocolFeatures::BACKEND_REQ
             | VhostUserProtocolFeatures::BACKEND_SEND_FD
             | VhostUserProtocolFeatures::REPLY_ACK
-            | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS;
+            | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
+            | VhostUserProtocolFeatures::LOG_SHMFD
+            | VhostUserProtocolFeatures::DEVICE_STATE;
 
         if self.tag.is_some() {
             protocol_features |= VhostUserProtocolFeatures::CONFIG;
@@ -471,11 +500,40 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
         result
     }
 
+    fn acked_features(&self, features: u64) {
+        if features & VhostUserVirtioFeatures::LOG_ALL.bits() != 0 {
+            // F_LOG_ALL set: Prepare for migration (unless we're already doing that)
+            let mut premigration_thread = self.premigration_thread.lock().unwrap();
+            if premigration_thread.is_none() {
+                let cancel = Arc::new(AtomicBool::new(false));
+                let cloned_server = Arc::clone(&self.thread.read().unwrap().server);
+                let cloned_cancel = Arc::clone(&cancel);
+                let handle =
+                    thread::spawn(move || cloned_server.prepare_serialization(cloned_cancel));
+                *premigration_thread = Some(PremigrationThread { handle, cancel });
+            }
+        } else {
+            // F_LOG_ALL cleared: Migration cancelled, if any was ongoing
+            // (Note that this is our interpretation, and not said by the specification.  The back
+            // end might clear this flag also on the source side once the VM has been stopped, even
+            // before we receive SET_DEVICE_STATE_FD.  QEMU will clear F_LOG_ALL only when the VM
+            // is running, i.e. when the source resumes after a cancelled migration, which is
+            // exactly what we want, but it would be better if we had a more reliable way that is
+            // backed up by the spec.  We could delay cancelling until we receive a guest request
+            // while F_LOG_ALL is cleared, but that can take an indefinite amount of time.)
+            if let Some(premigration_thread) = self.premigration_thread.lock().unwrap().take() {
+                premigration_thread.cancel.store(true, Ordering::Relaxed);
+                // Ignore the result, we are cancelling anyway
+                let _ = premigration_thread.handle.join();
+            }
+        }
+    }
+
     fn set_event_idx(&self, enabled: bool) {
         self.thread.write().unwrap().event_idx = enabled;
     }
 
-    fn update_memory(&self, mem: GuestMemoryAtomic<GuestMemoryMmap>) -> VhostUserBackendResult<()> {
+    fn update_memory(&self, mem: LoggedMemoryAtomic) -> VhostUserBackendResult<()> {
         self.thread.write().unwrap().mem = Some(mem);
         Ok(())
     }
@@ -484,7 +542,7 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
         &self,
         device_event: u16,
         evset: EventSet,
-        vrings: &[VringMutex],
+        vrings: &[VringMutex<LoggedMemoryAtomic>],
         _thread_id: usize,
     ) -> VhostUserBackendResult<()> {
         if evset != EventSet::IN {
@@ -506,6 +564,83 @@ impl<F: FileSystem + Send + Sync + 'static> VhostUserBackend for VhostUserFsBack
 
     fn set_backend_req_fd(&self, vu_req: Backend) {
         self.thread.write().unwrap().vu_req = Some(vu_req);
+    }
+
+    fn set_device_state_fd(
+        &self,
+        direction: VhostTransferStateDirection,
+        phase: VhostTransferStatePhase,
+        file: File,
+    ) -> io::Result<Option<File>> {
+        if phase != VhostTransferStatePhase::STOPPED {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Transfer in phase {:?} is not supported", phase),
+            ));
+        }
+
+        let server = Arc::clone(&self.thread.read().unwrap().server);
+        let join_handle = match direction {
+            VhostTransferStateDirection::SAVE => {
+                if let Some(premigration_thread) = self.premigration_thread.lock().unwrap().take() {
+                    // It isn't great to have this vhost-user message block, but if the
+                    // preparations are still ongoing, we have no choice
+                    premigration_thread.handle.join().map_err(|_| {
+                        other_io_error("Failed to finalize serialization preparation".to_string())
+                    })??;
+                }
+
+                thread::spawn(move || {
+                    server.serialize(file).map_err(|e| {
+                        io::Error::new(e.kind(), format!("Failed to save state: {}", e))
+                    })
+                })
+            }
+
+            VhostTransferStateDirection::LOAD => {
+                if let Some(premigration_thread) = self.premigration_thread.lock().unwrap().take() {
+                    // Strange, but OK
+                    premigration_thread.cancel.store(true, Ordering::Relaxed);
+                    warn!("Cancelling serialization preparation because of incoming migration");
+                    let _ = premigration_thread.handle.join();
+                }
+
+                thread::spawn(move || {
+                    server.deserialize_and_apply(file).map_err(|e| {
+                        io::Error::new(e.kind(), format!("Failed to load state: {}", e))
+                    })
+                })
+            }
+        };
+
+        *self.migration_thread.lock().unwrap() = Some(join_handle);
+
+        Ok(None)
+    }
+
+    fn check_device_state(&self) -> io::Result<()> {
+        let result = if let Some(migration_thread) = self.migration_thread.lock().unwrap().take() {
+            // `Result::flatten()` is not stable yet, so no `.join().map_err(...).flatten()`
+            match migration_thread.join() {
+                Ok(x) => x,
+                Err(_) => Err(other_io_error("Failed to join the migration thread")),
+            }
+        } else {
+            // `check_device_state()` must follow a successful `set_device_state_fd()`, so this is
+            // a protocol violation
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Front-end attempts to check migration state, but no migration has been done",
+            ))
+        };
+
+        // Note that just like any other vhost-user message implementation, the error object that
+        // we return is not forwarded to the front end (it only receives an error flag), so if we
+        // want users to see some diagnostics, we have to print them ourselves
+        if let Err(e) = &result {
+            error!("Migration failed: {e}");
+        }
+        result
     }
 }
 
@@ -749,6 +884,69 @@ struct Opt {
     /// without having ownership/capability to use O_NOATIME).
     #[arg(long = "preserve-noatime")]
     preserve_noatime: bool,
+
+    /// Defines how to perform migration, i.e. how to represent the internal state to the
+    /// destination, and how to obtain that representation.
+    ///
+    /// - find-paths: Iterate through the shared directory (exhaustive search) to find paths for
+    ///   all inodes indexed and opened by the guest, and transfer these paths to the destination.
+    ///
+    /// This parameter is ignored on the destination side.
+    #[arg(long = "migration-mode", default_value = "find-paths")]
+    migration_mode: MigrationMode,
+
+    /// Controls how to respond to errors during migration.
+    ///
+    /// If any inode turns out not to be migrateable (either the source cannot serialize it, or the
+    /// destination cannot opened the serialized representation), the destination can react in
+    /// different ways:
+    ///
+    /// - abort: Whenever any error occurs, return a hard error to the vhost-user front-end (e.g.
+    ///          QEMU), aborting migration.
+    ///
+    /// - guest-error: Let migration finish, but the guest will be unable to access any of the
+    ///                affected inodes, receiving only errors.
+    ///
+    /// This parameter is ignored on the source side.
+    #[arg(long = "migration-on-error", default_value = "abort")]
+    migration_on_error: MigrationOnError,
+
+    /// Ensure that the migration destination opens the very same inodes as the source (only works
+    /// if source and destination use the same shared directory on the same filesystem).
+    ///
+    /// This option makes the source attach the respective file handle to each inode transferred
+    /// during migration.  Once the destination has (re-)opened the inode, it will generate the
+    /// file handle on its end, and compare, ensuring that it has opened the very same inode.
+    ///
+    /// (File handles are per-filesystem unique identifiers for inodes that, besides the inode ID,
+    /// also include a generation ID to protect against inode ID reuse.)
+    ///
+    /// Using this option protects against external parties renaming or replacing inodes
+    /// while migration is ongoing, which, without this option, can lead to data loss or
+    /// corruption, so it should always be used when other processes besides virtiofsd have write
+    /// access to the shared directory.  However, again, it only works if both source and
+    /// destination use the same shared directory.
+    ///
+    /// This parameter is ignored on the destination side.
+    #[arg(long = "migration-verify-handles")]
+    migration_verify_handles: bool,
+
+    /// Double-check the identity of inodes right before switching over to the destination,
+    /// potentially making migration more resilient when third parties have write access to the
+    /// shared directory.
+    ///
+    /// When representing migrated inodes using their paths relative to the shared directory,
+    /// double-check during switch-over to the destination that each path still matches the
+    /// respective inode, and on mismatch, try to correct it via the respective symlink in
+    /// /proc/self/fd.
+    ///
+    /// Because this option requires accessing each inode indexed or opened by the guest, it can
+    /// prolong the switch-over phase of migration (when both source and destination are paused)
+    /// for an indeterminate amount of time.
+    ///
+    /// This parameter is ignored on the destination side.
+    #[arg(long = "migration-confirm-paths")]
+    migration_confirm_paths: bool,
 }
 
 fn parse_compat(opt: Opt) -> Opt {
@@ -843,7 +1041,10 @@ fn parse_compat(opt: Opt) -> Opt {
 
 fn print_capabilities() {
     println!("{{");
-    println!("  \"type\": \"fs\"");
+    println!("  \"type\": \"fs\",");
+    println!("  \"features\": [");
+    println!("    \"migrate-precopy\"");
+    println!("  ]");
     println!("}}");
 }
 
@@ -1161,6 +1362,10 @@ fn main() {
         posix_acl: opt.posix_acl,
         clean_noatime: !opt.preserve_noatime && !has_noatime_capability(),
         allow_mmap: opt.allow_mmap,
+        migration_on_error: opt.migration_on_error,
+        migration_verify_handles: opt.migration_verify_handles,
+        migration_confirm_paths: opt.migration_confirm_paths,
+        migration_mode: opt.migration_mode,
         ..Default::default()
     };
 

@@ -329,6 +329,88 @@ This range can be mapped to the GIDs [0, 65535] in virtiofsd’s user namespace 
 Alternatively, you can simply map your own GID to a single GID in the namespace:
 For example, --gid-map=:0:1000:1: would map GID 1000 to root’s GID in the namespace (and thus the guest).
 
+```shell
+--migration-mode=<find-paths>
+```
+Defines how to perform migration, i.e. how to represent the internal state to the destination
+instance, and how to obtain that representation.  Note that (when using QEMU) **QEMU version 8.2**
+or newer is required to use virtio-fs migration.
+
+virtiofsd internally holds references to all inodes indexed or opened by the guest.  During
+migration, these references need to be transferred to the destination; how that is done is
+determined with this switch:
+
+- **find-paths**: Iterate through the shared directory (exhaustive search) to find paths for all
+  inodes held by the source instance (relative to the shared directory), transfer these paths to the
+  destination, and let the destination instance open these paths.  This allows migration without
+  requiring special privileges, and regardless of whether source and destination use the same shared
+  directory; but it is expensive in terms of I/O (DFS through the shared directory) and is
+  vulnerable to third parties changing metadata in the shared directory while migration is ongoing
+  (e.g. renaming, unlinking, removing permissions), which can potentially lead to data loss and/or
+  corruption.
+
+This parameter is ignored on the destination side of migration.
+
+```shell
+--migration-on-error=<abort|guest-error>
+```
+Controls how to respond to errors during migration.
+
+During migration, some inodes that the guest has indexed or opened may turn out not to be
+migrateable: Either the source instance cannot construct instructions on how the destination
+instance may be able to find/open some inode, or the destination instance finds itself unable to
+follow those instructions.  In all cases, the destination instance is notified of these inodes, and
+then decides what to do depending on the value of this parameter:
+
+- **abort**: Whenever the destination instance sees any such error, it returns a hard error to the
+  vhost-user front-end (e.g. QEMU), which aborts migration.  Execution is to continue on the source
+  VM.
+
+- **guest-error**: Migration is allowed to finish, but all affected inodes are marked as invalid.
+  The guest will not be able to access any such inode, receiving only errors.
+
+Note that this parameter is to be used purely for the destination instance; its value is ignored on
+the source side of migration.
+
+```shell
+--migration-verify-handles
+```
+Ensure that the migration destination opens the very same inodes as the source.  This only works if
+source and destination are to use the same shared directory on the same filesystem.
+
+On migration, the source instance informs the destination instance of all inodes the guest has
+indexed or opened, and has the destination re-open them.  This switch makes the source generate a
+file handle for each such inode, and send it to the destination, allowing the destination to
+re-generate the same file handle for the inode it has opened and verify that it is equal, proving it
+is the same inode.
+
+(File handles are per-filesystem unique identifiers for inodes that, besides the inode ID, also
+include a generation ID to protect against inode ID reuse.)
+
+Using this option protects against external parties renaming or replacing inodes while migration is
+ongoing, which, without this option, can lead to data loss or corruption, so it should always be
+used when other processes besides virtiofsd have write access to the shared directory.  However,
+again, it only works if both source and destination use the same shared directory; though in the
+case of network filesystems, this does not require them to run on the same host.
+
+This parameter is ignored on the destination side of migration.
+
+```shell
+--migration-confirm-paths
+```
+Double-check the identity of inodes right before switching over to the destination, potentially
+making migration more resilient when third parties have write access to the shared directory.
+
+When representing migrated inodes by their paths relative to the shared directory, double-check
+during switch-over to the destination that each path still matches the respective inode.  If a path
+does not match, try to correct by consulting the respective symbolic link in */proc/self/fd*.
+
+Note that this option requires accessing each inode indexed or opened by the guest once during the
+switch-over stage of migration, when both the source and destination VM are paused, so can prolong
+that phase for an indeterminate amount of time.
+
+This parameter is ignored on the destination side of migration.
+
 ### Examples
 Export `/mnt` on vhost-user UNIX domain socket `/tmp/vfsd.sock`:
 
