@@ -1049,7 +1049,8 @@ fn print_capabilities() {
     println!("{{");
     println!("  \"type\": \"fs\",");
     println!("  \"features\": [");
-    println!("    \"migrate-precopy\"");
+    println!("    \"migrate-precopy\",");
+    println!("    \"separate-options\"");
     println!("  ]");
     println!("}}");
 }
