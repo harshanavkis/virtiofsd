@@ -334,7 +334,10 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             // requests on the queue.
             loop {
                 vrings[idx].disable_notification().unwrap();
-                self.process_queue_pool(vrings[idx].clone())?;
+                // we can't recover from an error here, so let's hope it's transient
+                if let Err(e) = self.process_queue_pool(vrings[idx].clone()) {
+                    error!("processing the vring {idx}: {e}");
+                }
                 if !vrings[idx].enable_notification().unwrap() {
                     break;
                 }
@@ -371,7 +374,10 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             // requests on the queue.
             loop {
                 vring_state.disable_notification().unwrap();
-                self.process_queue_serial(&mut vring_state)?;
+                // we can't recover from an error here, so let's hope it's transient
+                if let Err(e) = self.process_queue_serial(&mut vring_state) {
+                    error!("processing the vring: {e}");
+                }
                 if !vring_state.enable_notification().unwrap() {
                     break;
                 }
