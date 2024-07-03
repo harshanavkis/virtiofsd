@@ -1230,6 +1230,9 @@ impl FileSystem for PassthroughFs {
     type DirIter = ReadDir<Vec<u8>>;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        // Force-wipe prior state in case someone "forgot" to send a DESTROY
+        self.destroy();
+
         self.open_root_node()?;
 
         // Note: On migration, all options negotiated here with the guest must be sent to the
