@@ -3,6 +3,7 @@
   "type": "fs",
   "binary": "/usr/libexec/virtiofsd",
   "features": [
-      "migrate-precopy"
+      "migrate-precopy",
+      "separate-options"
   ]
 }
