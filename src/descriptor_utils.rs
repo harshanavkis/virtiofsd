@@ -14,8 +14,8 @@ use vhost_user_backend::bitmap::BitmapMmapRegion;
 use virtio_queue::DescriptorChain;
 use vm_memory::bitmap::{Bitmap, BitmapSlice};
 use vm_memory::{
-    Address, ByteValued, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion, Le16,
-    Le32, Le64, VolatileMemory, VolatileMemoryError, VolatileSlice,
+    Address, ByteValued, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+    VolatileMemory, VolatileMemoryError, VolatileSlice,
 };
 
 use crate::file_traits::FileReadWriteAtVolatile;
@@ -436,38 +436,38 @@ pub enum DescriptorType {
     Writable,
 }
 
-#[derive(Copy, Clone, Debug, Default)]
-#[repr(C)]
-struct virtq_desc {
-    addr: Le64,
-    len: Le32,
-    flags: Le16,
-    next: Le16,
-}
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl ByteValued for virtq_desc {}
-
-#[derive(Copy, Clone, Debug, Default)]
-#[repr(C)]
-struct virtq_avail {
-    flags: Le16,
-    idx: Le16,
-    ring: Le16,
-}
-
-// Safe because it only has data and has no implicit padding.
-unsafe impl ByteValued for virtq_avail {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use virtio_queue::{Queue, QueueOwnedT, QueueT};
-    use vm_memory::{Bytes, GuestAddress};
+    use vm_memory::{Bytes, GuestAddress, Le16, Le32, Le64};
 
     const VIRTQ_DESC_F_NEXT: u16 = 0x1;
     const VIRTQ_DESC_F_WRITE: u16 = 0x2;
     const MAX_QUEUE_SIZE: u16 = 32768;
+
+    #[derive(Copy, Clone, Debug, Default)]
+    #[repr(C)]
+    struct virtq_desc {
+        addr: Le64,
+        len: Le32,
+        flags: Le16,
+        next: Le16,
+    }
+
+    // Safe because it only has data and has no implicit padding.
+    unsafe impl ByteValued for virtq_desc {}
+
+    #[derive(Copy, Clone, Debug, Default)]
+    #[repr(C)]
+    struct virtq_avail {
+        flags: Le16,
+        idx: Le16,
+        ring: Le16,
+    }
+
+    // Safe because it only has data and has no implicit padding.
+    unsafe impl ByteValued for virtq_avail {}
 
     /// Test utility function to create a descriptor chain in guest memory.
     pub fn create_descriptor_chain(

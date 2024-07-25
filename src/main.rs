@@ -787,9 +787,9 @@ struct Opt {
     /// - never: Never use file handles, always use O_PATH file descriptors.
     ///
     /// - prefer: Attempt to generate file handles, but fall back to O_PATH file descriptors where
-    /// the underlying filesystem does not support file handles.  Useful when there are various
-    /// different filesystems under the shared directory and some of them do not support file
-    /// handles.  ("fallback" is a deprecated alias for "prefer".)
+    ///   the underlying filesystem does not support file handles.  Useful when there are various
+    ///   different filesystems under the shared directory and some of them do not support file
+    ///   handles.  ("fallback" is a deprecated alias for "prefer".)
     ///
     /// - mandatory: Always use file handles, never fall back to O_PATH file descriptors.
     ///
