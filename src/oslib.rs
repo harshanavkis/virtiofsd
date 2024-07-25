@@ -165,10 +165,10 @@ pub fn openat(dir: &impl AsRawFd, pathname: &CStr, flags: i32, mode: Option<u32>
 /// An utility function that uses `openat2(2)` to restrict the how the provided pathname
 /// is resolved. It uses the following flags:
 /// - `RESOLVE_IN_ROOT`: Treat the directory referred to by dirfd as the root directory while
-/// resolving pathname. This has the effect as though virtiofsd had used chroot(2) to modify its
-/// root directory to dirfd.
+///   resolving pathname. This has the effect as though virtiofsd had used chroot(2) to modify its
+///   root directory to dirfd.
 /// - `RESOLVE_NO_MAGICLINKS`: Disallow all magic-link (i.e., proc(2) link-like files) resolution
-/// during path resolution.
+///   during path resolution.
 ///
 /// Additionally, the flags `O_NOFOLLOW` and `O_CLOEXEC` are added.
 ///
