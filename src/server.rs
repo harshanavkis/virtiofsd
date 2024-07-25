@@ -1526,7 +1526,7 @@ impl<F: FileSystem + Sync> Server<F> {
 }
 
 impl<F: FileSystem + SerializableFileSystem + Sync> SerializableFileSystem for Server<F> {
-    fn prepare_serialization(&self, cancel: Arc<AtomicBool>) -> io::Result<()> {
+    fn prepare_serialization(&self, cancel: Arc<AtomicBool>) {
         self.fs.prepare_serialization(cancel)
     }
 

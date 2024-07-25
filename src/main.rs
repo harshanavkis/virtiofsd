@@ -412,7 +412,7 @@ impl Default for VirtioFsConfig {
 unsafe impl ByteValued for VirtioFsConfig {}
 
 struct PremigrationThread {
-    handle: JoinHandle<io::Result<()>>,
+    handle: JoinHandle<()>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -620,7 +620,7 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
                     // preparations are still ongoing, we have no choice
                     premigration_thread.handle.join().map_err(|_| {
                         other_io_error("Failed to finalize serialization preparation".to_string())
-                    })??;
+                    })?;
                 }
 
                 thread::spawn(move || {

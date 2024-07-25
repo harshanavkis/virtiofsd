@@ -67,8 +67,11 @@ pub(super) struct PathReconstructor<'a> {
 /// Different implementations of this trait can create different variants of the
 /// `InodeMigrationInfo` enum.
 pub(super) trait InodeMigrationInfoConstructor {
-    /// Runs the constructor
-    fn execute(self) -> io::Result<()>;
+    /// Runs the constructor.  Must not fail: Collecting inodes’ migration info is supposed to be a
+    /// best-effort operation.  We can leave any and even all inodes’ migration info empty, then
+    /// serialize them as invalid inodes, and let the destination decide what to do based on its
+    /// --migration-on-error setting.
+    fn execute(self);
 }
 
 impl InodeMigrationInfo {
@@ -151,41 +154,62 @@ impl<'a> PathReconstructor<'a> {
     }
 
     /// Recurse from the given directory inode
-    fn recurse_from(&self, root_ref: StrongInodeReference) -> io::Result<()> {
+    fn recurse_from(&self, root_ref: StrongInodeReference) {
         let mut dir_buf = vec![0u8; 1024];
 
         // We don't actually use recursion (to not exhaust the stack), but keep a list of
         // directories we still need to visit, and pop from it until it is empty and we're done
         let mut remaining_dirs = vec![root_ref];
         while let Some(inode_ref) = remaining_dirs.pop() {
-            let dirfd = inode_ref.get().open_file(
+            let dirfd = match inode_ref.get().open_file(
                 libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 &self.fs.proc_self_fd,
-            )?;
+            ) {
+                Ok(fd) => fd,
+                Err(err) => {
+                    let dir_id = inode_ref.get().identify(&self.fs.proc_self_fd);
+                    warn!("Failed to recurse into {dir_id}: {err}");
+                    continue;
+                }
+            };
 
             // Read all directory entries, check them for matches in our inode store, and add any
             // directory to `remaining_dirs`
             loop {
                 // Safe because we use nothing but this function on the FD
-                let mut entries = unsafe { ReadDir::new_no_seek(&dirfd, dir_buf.as_mut()) }?;
+                let read_dir_result = unsafe { ReadDir::new_no_seek(&dirfd, dir_buf.as_mut()) };
+                let mut entries = match read_dir_result {
+                    Ok(entries) => entries,
+                    Err(err) => {
+                        let dir_id = inode_ref.get().identify(&self.fs.proc_self_fd);
+                        warn!("Failed to read directory entries of {dir_id}: {err}");
+                        break;
+                    }
+                };
                 if entries.remaining() == 0 {
                     break;
                 }
 
                 while let Some(entry) = entries.next() {
                     if self.cancel.load(Ordering::Relaxed) {
-                        return Err(other_io_error("Cancelled serialization preparation"));
+                        return;
                     }
 
-                    if let Some(entry_inode) = self.discover(&inode_ref, &dirfd, entry.name)? {
-                        // Add directories to visit to the list
-                        remaining_dirs.push(entry_inode);
+                    match self.discover(&inode_ref, &dirfd, entry.name) {
+                        Ok(Some(entry_inode)) => {
+                            // Add directories to visit to the list
+                            remaining_dirs.push(entry_inode);
+                        }
+                        Ok(None) => (),
+                        Err(err) => {
+                            let dir_id = inode_ref.get().identify(&self.fs.proc_self_fd);
+                            let name = entry.name.to_string_lossy();
+                            warn!("Failed to discover entry {name} of {dir_id}: {err}");
+                        }
                     }
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Check the given directory entry (parent + name) for matches in our inode store.  If we find
@@ -291,12 +315,11 @@ impl<'a> PathReconstructor<'a> {
 
 impl InodeMigrationInfoConstructor for PathReconstructor<'_> {
     /// Recurse from the root directory (the shared directory)
-    fn execute(self) -> io::Result<()> {
+    fn execute(self) {
+        // Only need to do something if we have a root node to recurse from; otherwise the
+        // filesystem is not mounted and we do not need to do anything.
         if let Ok(root) = self.fs.inodes.get_strong(fuse::ROOT_ID) {
-            self.recurse_from(root)
-        } else {
-            // No root node?  Then the filesystem is not mounted and we do not need to do anything.
-            Ok(())
+            self.recurse_from(root);
         }
     }
 }
