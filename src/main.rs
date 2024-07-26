@@ -615,15 +615,34 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
         let server = Arc::clone(&self.thread.read().unwrap().server);
         let join_handle = match direction {
             VhostTransferStateDirection::SAVE => {
-                if let Some(premigration_thread) = self.premigration_thread.lock().unwrap().take() {
-                    // It isn't great to have this vhost-user message block, but if the
-                    // preparations are still ongoing, we have no choice
-                    premigration_thread.handle.join().map_err(|_| {
-                        other_io_error("Failed to finalize serialization preparation".to_string())
-                    })?;
-                }
+                // We should have a premigration thread that was started with `F_LOG_ALL`.  It
+                // should already be finished, but you never know.
+                let premigration_thread = self.premigration_thread.lock().unwrap().take();
 
                 thread::spawn(move || {
+                    if let Some(premigration_thread) = premigration_thread {
+                        // Let’s hope it’s finished.  Otherwise, we block migration downtime for a
+                        // bit longer, but there’s nothing we can do.
+                        premigration_thread.handle.join().map_err(|_| {
+                            other_io_error(
+                                "Failed to finalize serialization preparation".to_string(),
+                            )
+                        })?;
+                    } else {
+                        // If we don’t have a premigration thread, that either means migration was
+                        // cancelled at some point (i.e. F_LOG_ALL cleared; very unlikely and we
+                        // consider sending SET_DEVICE_STATE_FD afterwards a protocol violation),
+                        // or that there simply was no F_LOG_ALL at all.  QEMU doesn’t necessarily
+                        // do memory logging when snapshotting, and in such cases we have no choice
+                        // but to just run preserialization now.
+                        warn!(
+                            "Front-end did not announce migration to begin, so we failed to \
+                            prepare for it; collecting data now.  If you are doing a snapshot, \
+                            that is OK; otherwise, migration downtime may be prolonged."
+                        );
+                        server.prepare_serialization(Arc::new(AtomicBool::new(false)));
+                    }
+
                     server.serialize(file).map_err(|e| {
                         io::Error::new(e.kind(), format!("Failed to save state: {}", e))
                     })
