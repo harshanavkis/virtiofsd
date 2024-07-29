@@ -1179,6 +1179,22 @@ impl PassthroughFs {
             FileOrHandle::File(path_fd)
         };
 
+        // Always keep the root node's migration info set (`InodeStore::clear_migration_info()`
+        // will not clear it either); this way, whenever the filesystem is mounted (and this
+        // function is called), we will have it set and can migrate it.
+        // (Other nodes' migration info is set in `do_lookup()` when they are discovered during
+        // migration.)
+        let migration_info = match InodeMigrationInfo::new_root(&self.cfg, &file_or_handle) {
+            Ok(mig_info) => Some(mig_info),
+            Err(err) => {
+                warn!(
+                    "Failed to construct migration information for the root node: {err}; \
+                    may not be able to migrate"
+                );
+                None
+            }
+        };
+
         // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
         let inode = InodeData {
             inode: fuse::ROOT_ID,
@@ -1190,7 +1206,7 @@ impl PassthroughFs {
                 mnt_id: st.mnt_id,
             },
             mode: st.st.st_mode,
-            migration_info: Mutex::new(None),
+            migration_info: Mutex::new(migration_info),
         };
         self.inodes.new_inode(inode)?;
         Ok(())

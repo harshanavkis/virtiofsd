@@ -109,6 +109,24 @@ impl InodeMigrationInfo {
             file_handle,
         })
     }
+
+    /// Use this for the root node.  That node is special in that the destination gets no
+    /// information on how to find it, because that is configured by the user.
+    pub(in crate::passthrough) fn new_root(
+        fs_cfg: &passthrough::Config,
+        file_or_handle: &FileOrHandle,
+    ) -> io::Result<Self> {
+        let file_handle: Option<SerializableFileHandle> = if fs_cfg.migration_verify_handles {
+            Some(file_or_handle.try_into()?)
+        } else {
+            None
+        };
+
+        Ok(InodeMigrationInfo {
+            location: InodeLocation::RootNode,
+            file_handle,
+        })
+    }
 }
 
 impl HandleMigrationInfo {
@@ -275,17 +293,6 @@ impl InodeMigrationInfoConstructor for PathReconstructor<'_> {
     /// Recurse from the root directory (the shared directory)
     fn execute(self) -> io::Result<()> {
         if let Ok(root) = self.fs.inodes.get_strong(fuse::ROOT_ID) {
-            // Root node is special in that the destination gets no information on how to find it,
-            // because that is configured by the user
-            *root.get().migration_info.lock().unwrap() = Some(InodeMigrationInfo {
-                location: InodeLocation::RootNode,
-                file_handle: if self.fs.cfg.migration_verify_handles {
-                    Some((&root.get().file_or_handle).try_into()?)
-                } else {
-                    None
-                },
-            });
-
             self.recurse_from(root)
         } else {
             // No root node?  Then the filesystem is not mounted and we do not need to do anything.
