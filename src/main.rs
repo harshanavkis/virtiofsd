@@ -412,7 +412,7 @@ impl Default for VirtioFsConfig {
 unsafe impl ByteValued for VirtioFsConfig {}
 
 struct PremigrationThread {
-    handle: JoinHandle<io::Result<()>>,
+    handle: JoinHandle<()>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -578,6 +578,33 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserBa
         phase: VhostTransferStatePhase,
         file: File,
     ) -> io::Result<Option<File>> {
+        // Our caller (vhost-user-backend crate) pretty much ignores error objects we return (only
+        // cares whether we succeed or not), so log errors here
+        if let Err(err) = self.do_set_device_state_fd(direction, phase, file) {
+            error!("Failed to initiate state (de-)serialization: {err}");
+            return Err(err);
+        }
+        Ok(None)
+    }
+
+    fn check_device_state(&self) -> io::Result<()> {
+        // Our caller (vhost-user-backend crate) pretty much ignores error objects we return (only
+        // cares whether we succeed or not), so log errors here
+        if let Err(err) = self.do_check_device_state() {
+            error!("Failed to conclude migration: {err}");
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFsBackend<F> {
+    fn do_set_device_state_fd(
+        &self,
+        direction: VhostTransferStateDirection,
+        phase: VhostTransferStatePhase,
+        file: File,
+    ) -> io::Result<()> {
         if phase != VhostTransferStatePhase::STOPPED {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -593,7 +620,7 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserBa
                     // preparations are still ongoing, we have no choice
                     premigration_thread.handle.join().map_err(|_| {
                         other_io_error("Failed to finalize serialization preparation".to_string())
-                    })??;
+                    })?;
                 }
 
                 thread::spawn(move || {
@@ -621,10 +648,10 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserBa
 
         *self.migration_thread.lock().unwrap() = Some(join_handle);
 
-        Ok(None)
+        Ok(())
     }
 
-    fn check_device_state(&self) -> io::Result<()> {
+    fn do_check_device_state(&self) -> io::Result<()> {
         let result = if let Some(migration_thread) = self.migration_thread.lock().unwrap().take() {
             // `Result::flatten()` is not stable yet, so no `.join().map_err(...).flatten()`
             match migration_thread.join() {

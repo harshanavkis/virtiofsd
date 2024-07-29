@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 /// Adds serialization (migration) capabilities to `PassthroughFs`
 impl SerializableFileSystem for PassthroughFs {
-    fn prepare_serialization(&self, cancel: Arc<AtomicBool>) -> io::Result<()> {
+    fn prepare_serialization(&self, cancel: Arc<AtomicBool>) {
         self.inodes.clear_migration_info();
 
         // Set this so the filesystem code knows that every node is supposed to have up-to-date
@@ -41,12 +41,7 @@ impl SerializableFileSystem for PassthroughFs {
         // Create the reconstructor (which reconstructs parent+filename information for each node
         // in our inode store), and run it
         let reconstructor = PathReconstructor::new(self, cancel);
-        let result = reconstructor.execute();
-        if result.is_err() {
-            // Do not leave incomplete data behind (cancelling returns an error, too, landing here)
-            self.inodes.clear_migration_info();
-        }
-        result
+        reconstructor.execute();
     }
 
     fn serialize(&self, mut state_pipe: File) -> io::Result<()> {

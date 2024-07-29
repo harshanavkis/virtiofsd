@@ -143,6 +143,29 @@ impl<'a> InodeData {
             FileOrHandle::Invalid(err) => Err(io::Error::new(err.kind(), Arc::clone(err))),
         }
     }
+
+    /// Return some human-readable identification of this inode, ideally the path.  Will perform
+    /// I/O, so is not extremely cheap to call.
+    pub fn identify(&self, proc_self_fd: &File) -> String {
+        if let Ok(path) = self.get_path(proc_self_fd) {
+            path.to_string_lossy().to_string()
+        } else {
+            let mode = match self.mode & libc::S_IFMT {
+                libc::S_IFREG => "file",
+                libc::S_IFDIR => "directory",
+                libc::S_IFLNK => "symbolic link",
+                libc::S_IFIFO => "FIFO",
+                libc::S_IFSOCK => "socket",
+                libc::S_IFCHR => "character device",
+                libc::S_IFBLK => "block device",
+                _ => "unknown inode type",
+            };
+            format!(
+                "[{}; mount_id={} device_id={} inode_id={}]",
+                mode, self.ids.mnt_id, self.ids.dev, self.ids.ino,
+            )
+        }
+    }
 }
 
 impl InodeFile<'_> {

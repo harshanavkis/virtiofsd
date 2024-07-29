@@ -1204,12 +1204,7 @@ pub trait SerializableFileSystem {
     /// This function is generally run in a separate thread, so is allowed to block and take time
     /// to complete.  It should regularly check the value of the `cancel` bool, though, and if it
     /// becomes set, cancel the preparation and return as soon as reasonably possible.
-    fn prepare_serialization(&self, _cancel: Arc<AtomicBool>) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "State serialization not supported",
-        ))
-    }
+    fn prepare_serialization(&self, _cancel: Arc<AtomicBool>) {}
 
     /// Serialize the filesystem state.
     ///
