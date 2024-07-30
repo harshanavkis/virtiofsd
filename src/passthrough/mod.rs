@@ -2461,7 +2461,10 @@ impl HandleDataFile {
     fn get(&self) -> io::Result<&'_ RwLock<File>> {
         match self {
             HandleDataFile::File(file) => Ok(file),
-            HandleDataFile::Invalid(err) => Err(io::Error::new(err.kind(), Arc::clone(err))),
+            HandleDataFile::Invalid(err) => Err(io::Error::new(
+                err.kind(),
+                format!("Handle is invalid because of an error during the preceding migration, which was: {err}"),
+            )),
         }
     }
 }
