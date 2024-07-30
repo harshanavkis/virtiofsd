@@ -591,7 +591,7 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserBa
         // Our caller (vhost-user-backend crate) pretty much ignores error objects we return (only
         // cares whether we succeed or not), so log errors here
         if let Err(err) = self.do_check_device_state() {
-            error!("Failed to conclude migration: {err}");
+            error!("Migration failed: {err}");
             return Err(err);
         }
         Ok(())
@@ -671,28 +671,18 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
     }
 
     fn do_check_device_state(&self) -> io::Result<()> {
-        let result = if let Some(migration_thread) = self.migration_thread.lock().unwrap().take() {
-            // `Result::flatten()` is not stable yet, so no `.join().map_err(...).flatten()`
-            match migration_thread.join() {
-                Ok(x) => x,
-                Err(_) => Err(other_io_error("Failed to join the migration thread")),
-            }
-        } else {
+        let Some(migration_thread) = self.migration_thread.lock().unwrap().take() else {
             // `check_device_state()` must follow a successful `set_device_state_fd()`, so this is
             // a protocol violation
-            Err(io::Error::new(
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Front-end attempts to check migration state, but no migration has been done",
-            ))
+            ));
         };
 
-        // Note that just like any other vhost-user message implementation, the error object that
-        // we return is not forwarded to the front end (it only receives an error flag), so if we
-        // want users to see some diagnostics, we have to print them ourselves
-        if let Err(e) = &result {
-            error!("Migration failed: {e}");
-        }
-        result
+        migration_thread
+            .join()
+            .map_err(|_| other_io_error("Failed to join the migration thread"))?
     }
 }
 
