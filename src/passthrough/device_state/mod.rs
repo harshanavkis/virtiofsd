@@ -20,7 +20,7 @@ mod serialized;
 
 use crate::filesystem::SerializableFileSystem;
 use crate::passthrough::PassthroughFs;
-use preserialization::{InodeMigrationInfoConstructor, PathReconstructor};
+use preserialization::{find_paths, InodeMigrationInfoConstructor};
 use std::convert::{TryFrom, TryInto};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -40,7 +40,7 @@ impl SerializableFileSystem for PassthroughFs {
 
         // Create the reconstructor (which reconstructs parent+filename information for each node
         // in our inode store), and run it
-        let reconstructor = PathReconstructor::new(self, cancel);
+        let reconstructor = find_paths::PathReconstructor::new(self, cancel);
         reconstructor.execute();
     }
 

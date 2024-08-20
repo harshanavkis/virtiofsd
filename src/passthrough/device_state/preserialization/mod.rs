@@ -11,8 +11,6 @@ use std::io;
 
 pub mod find_paths;
 
-pub(in crate::passthrough) use find_paths::*;
-
 /// Precursor to `serialized::Inode` that is constructed while serialization is being prepared, and
 /// will then be transformed into the latter at the time of serialization.  To be stored in the
 /// inode store, alongside each inode (i.e. in its `InodeData`).  Constructing this is costly, so
