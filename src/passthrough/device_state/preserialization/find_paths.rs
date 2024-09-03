@@ -2,12 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use super::{InodeLocation, InodeMigrationInfo, InodeMigrationInfoConstructor};
 use crate::filesystem::DirectoryIterator;
 use crate::fuse;
-use crate::passthrough::file_handle::{FileHandle, SerializableFileHandle};
+use crate::passthrough::file_handle::FileHandle;
 use crate::passthrough::inode_store::{InodeData, InodeIds, StrongInodeReference};
 use crate::passthrough::stat::statx;
-use crate::passthrough::{self, FileOrHandle, PassthroughFs};
+use crate::passthrough::{FileOrHandle, PassthroughFs};
 use crate::read_dir::ReadDir;
 use crate::util::other_io_error;
 use std::convert::TryInto;
@@ -18,139 +19,55 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Precursor to `serialized::Inode` that is constructed while serialization is being prepared, and
-/// will then be transformed into the latter at the time of serialization.  To be stored in the
-/// inode store, alongside each inode (i.e. in its `InodeData`).  Constructing this is costly, so
-/// should only be done when necessary, i.e. when actually preparing for migration.
-pub(in crate::passthrough) struct InodeMigrationInfo {
-    /// Location of the inode (how the destination can find it)
-    pub(in crate::passthrough) location: InodeLocation,
-
-    /// The inode's file handle.  The destination is not supposed to open this handle, but instead
-    /// compare it against the one from the inode it has opened based on `location`.
-    pub(in crate::passthrough) file_handle: Option<SerializableFileHandle>,
-}
-
-pub(in crate::passthrough) enum InodeLocation {
-    /// The root node: No information is stored, the destination is supposed to find this on its
-    /// own (as configured by the user)
-    RootNode,
-
-    /// Inode is represented by its parent directory and its filename therein, allowing the
-    /// destination to `openat(2)` it
-    Path {
-        parent: StrongInodeReference,
-        filename: String,
-    },
-}
-
-/// Precursor to `SerializableHandleRepresentation` that is constructed while serialization is
-/// being prepared, and will then be transformed into the latter at the time of serialization.
-/// To be stored in the `handles` map, alongside each handle (i.e. in its `HandleData`).
-/// Constructing this is cheap, so can be done whenever any handle is created.
-pub(in crate::passthrough) enum HandleMigrationInfo {
-    /// Handle can be opened by opening its associated inode with the given `open(2)` flags
-    OpenInode { flags: i32 },
+/// The result of 'find-paths' pre-serialization: A filename relative to some parent inode.
+pub(in crate::passthrough) struct InodePath {
+    pub parent: StrongInodeReference,
+    pub filename: String,
 }
 
 /// Stores state for constructing serializable data for inodes using the `InodeMigrationInfo::Path`
 /// variant, in order to prepare for migration.
-pub(super) struct PathReconstructor<'a> {
+pub(in crate::passthrough::device_state) struct Constructor<'a> {
     /// Reference to the filesystem for which to reconstruct inodes' paths.
     fs: &'a PassthroughFs,
     /// Set to true when we are supposed to cancel
     cancel: Arc<AtomicBool>,
 }
 
-/// Constructs `InodeMigrationInfo` data for every inode in the inode store.  This may take a long
-/// time, and is the core part of our preserialization phase.
-/// Different implementations of this trait can create different variants of the
-/// `InodeMigrationInfo` enum.
-pub(super) trait InodeMigrationInfoConstructor {
-    /// Runs the constructor.  Must not fail: Collecting inodes’ migration info is supposed to be a
-    /// best-effort operation.  We can leave any and even all inodes’ migration info empty, then
-    /// serialize them as invalid inodes, and let the destination decide what to do based on its
-    /// --migration-on-error setting.
-    fn execute(self);
-}
-
-impl InodeMigrationInfo {
+impl InodePath {
     /// Create the migration info for an inode that is collected during the `prepare_serialization`
     /// phase
-    pub(in crate::passthrough) fn new(
-        fs_cfg: &passthrough::Config,
-        parent_ref: StrongInodeReference,
-        filename: &CStr,
-        file_or_handle: &FileOrHandle,
-    ) -> io::Result<Self> {
+    pub fn new_with_cstr(parent_ref: StrongInodeReference, filename: &CStr) -> io::Result<Self> {
         let utf8_name = filename.to_str().map_err(|err| {
             other_io_error(format!(
                 "Cannot convert filename into UTF-8: {filename:?}: {err}"
             ))
         })?;
 
-        Self::new_with_utf8_name(fs_cfg, parent_ref, utf8_name, file_or_handle)
-    }
-
-    fn new_with_utf8_name(
-        fs_cfg: &passthrough::Config,
-        parent_ref: StrongInodeReference,
-        filename: &str,
-        file_or_handle: &FileOrHandle,
-    ) -> io::Result<Self> {
-        let file_handle: Option<SerializableFileHandle> = if fs_cfg.migration_verify_handles {
-            Some(file_or_handle.try_into()?)
-        } else {
-            None
-        };
-
-        Ok(InodeMigrationInfo {
-            location: InodeLocation::Path {
-                parent: parent_ref,
-                filename: filename.to_string(),
-            },
-            file_handle,
+        Ok(InodePath {
+            parent: parent_ref,
+            filename: utf8_name.to_string(),
         })
     }
 
-    /// Use this for the root node.  That node is special in that the destination gets no
-    /// information on how to find it, because that is configured by the user.
-    pub(in crate::passthrough) fn new_root(
-        fs_cfg: &passthrough::Config,
-        file_or_handle: &FileOrHandle,
-    ) -> io::Result<Self> {
-        let file_handle: Option<SerializableFileHandle> = if fs_cfg.migration_verify_handles {
-            Some(file_or_handle.try_into()?)
-        } else {
-            None
-        };
-
-        Ok(InodeMigrationInfo {
-            location: InodeLocation::RootNode,
-            file_handle,
-        })
+    pub(super) fn for_each_strong_reference<F: FnMut(StrongInodeReference)>(self, mut f: F) {
+        f(self.parent);
     }
 }
 
-impl HandleMigrationInfo {
-    /// Create the migration info for a handle that will be required when serializing
-    pub(in crate::passthrough) fn new(flags: i32) -> Self {
-        HandleMigrationInfo::OpenInode {
-            // Remove flags that make sense when the file is first opened by the guest, but which
-            // we should not set when continuing to use the file after migration because they would
-            // e.g. modify the file
-            flags: flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC),
-        }
+impl From<InodePath> for InodeLocation {
+    fn from(path: InodePath) -> Self {
+        InodeLocation::Path(path)
     }
 }
 
-/// The `PathReconstructor` is an `InodeMigrationInfoConstructor` that creates `InodeMigrationInfo`
-/// of the `InodeMigrationInfo::Path` variant: It recurses through the filesystem (i.e. the shared
+/// The `Constructor` is an `InodeMigrationInfoConstructor` that creates `InodeMigrationInfo` of
+/// the `InodeMigrationInfo::Path` variant: It recurses through the filesystem (i.e. the shared
 /// directory), matching up all inodes it finds with our inode store, and thus finds the parent
 /// directory node and filename for every such inode.
-impl<'a> PathReconstructor<'a> {
-    pub(super) fn new(fs: &'a PassthroughFs, cancel: Arc<AtomicBool>) -> Self {
-        PathReconstructor { fs, cancel }
+impl<'a> Constructor<'a> {
+    pub fn new(fs: &'a PassthroughFs, cancel: Arc<AtomicBool>) -> Self {
+        Constructor { fs, cancel }
     }
 
     /// Recurse from the given directory inode
@@ -251,22 +168,19 @@ impl<'a> PathReconstructor<'a> {
         let is_directory = stat.st.st_mode & libc::S_IFMT == libc::S_IFDIR;
 
         if let Ok(inode_ref) = self.fs.inodes.claim_inode(handle.as_ref(), &ids) {
-            let file_handle = if self.fs.cfg.migration_verify_handles {
-                Some(match &handle {
-                    Some(h) => h.into(),
-                    None => FileHandle::from_fd_fail_hard(&path_fd)?.into(),
-                })
-            } else {
-                None
-            };
-
-            let mig_info = InodeMigrationInfo {
-                location: InodeLocation::Path {
+            let mig_info = InodeMigrationInfo::new_internal(
+                &self.fs.cfg,
+                InodePath {
                     parent: StrongInodeReference::clone(parent_reference),
                     filename: utf8_name.to_string(),
                 },
-                file_handle,
-            };
+                || {
+                    Ok(match &handle {
+                        Some(h) => h.into(),
+                        None => FileHandle::from_fd_fail_hard(&path_fd)?.into(),
+                    })
+                },
+            )?;
 
             *inode_ref.get().migration_info.lock().unwrap() = Some(mig_info);
 
@@ -293,11 +207,13 @@ impl<'a> PathReconstructor<'a> {
             FileOrHandle::File(path_fd)
         };
 
-        let mig_info = InodeMigrationInfo::new_with_utf8_name(
+        let mig_info = InodeMigrationInfo::new_internal(
             &self.fs.cfg,
-            StrongInodeReference::clone(parent_reference),
-            utf8_name,
-            &file_or_handle,
+            InodePath {
+                parent: StrongInodeReference::clone(parent_reference),
+                filename: utf8_name.to_string(),
+            },
+            || (&file_or_handle).try_into(),
         )?;
 
         let new_inode = InodeData {
@@ -313,7 +229,7 @@ impl<'a> PathReconstructor<'a> {
     }
 }
 
-impl InodeMigrationInfoConstructor for PathReconstructor<'_> {
+impl InodeMigrationInfoConstructor for Constructor<'_> {
     /// Recurse from the root directory (the shared directory)
     fn execute(self) {
         // Only need to do something if we have a root node to recurse from; otherwise the

@@ -166,7 +166,10 @@ impl InodeMigrationInfo {
         Ok(match &self.location {
             preserialization::InodeLocation::RootNode => serialized::InodeLocation::RootNode,
 
-            preserialization::InodeLocation::Path { parent, filename } => {
+            preserialization::InodeLocation::Path(preserialization::find_paths::InodePath {
+                parent,
+                filename,
+            }) => {
                 if fs.cfg.migration_confirm_paths {
                     if let Err(err) = self.check_presence(inode_data, parent.get(), filename) {
                         warn!(
