@@ -96,7 +96,10 @@ impl<'a> InodeData {
                 let file = h.open(libc::O_PATH)?;
                 Ok(InodeFile::Owned(file))
             }
-            FileOrHandle::Invalid(err) => Err(io::Error::new(err.kind(), Arc::clone(err))),
+            FileOrHandle::Invalid(err) => Err(io::Error::new(
+                err.kind(),
+                format!("Inode is invalid because of an error during the preceding migration, which was: {err}"),
+            )),
         }
     }
 
@@ -140,7 +143,10 @@ impl<'a> InodeData {
                 let new_file = h.open(flags)?;
                 Ok(InodeFile::Owned(new_file))
             }
-            FileOrHandle::Invalid(err) => Err(io::Error::new(err.kind(), Arc::clone(err))),
+            FileOrHandle::Invalid(err) => Err(io::Error::new(
+                err.kind(),
+                format!("Inode is invalid because of an error during the preceding migration, which was: {err}"),
+            )),
         }
     }
 
