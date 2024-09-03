@@ -1042,6 +1042,29 @@ impl PassthroughFs {
         }
     }
 
+    /// Clears S_ISGID from file mode
+    ///
+    /// * `file` - file reference (must implement AsRawFd)
+    /// * `o_path` - Must be `true` if the file referred to by `fd` was opened with the `O_PATH` flag
+    ///
+    /// If it is not clear whether `fd` was opened with `O_PATH` it is safe to set `o_path`
+    /// to `true`.
+    fn clear_sgid(&self, file: &impl AsRawFd, o_path: bool) -> io::Result<()> {
+        let fd = file.as_raw_fd();
+        let st = statx(file, None)?.st;
+
+        if o_path {
+            oslib::fchmodat(
+                self.proc_self_fd.as_raw_fd(),
+                format!("{fd}"),
+                st.st_mode & 0o7777 & !libc::S_ISGID,
+                0,
+            )
+        } else {
+            oslib::fchmod(fd, st.st_mode & 0o7777 & !libc::S_ISGID)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn do_create(
         &self,
@@ -2101,7 +2124,7 @@ impl FileSystem for PassthroughFs {
 
     fn setxattr(
         &self,
-        ctx: Context,
+        _ctx: Context,
         inode: Inode,
         name: &CStr,
         value: &[u8],
@@ -2116,38 +2139,11 @@ impl FileSystem for PassthroughFs {
         let name = self.map_client_xattrname(name)?;
 
         // If we are setting posix access acl and if SGID needs to be
-        // cleared, then switch to caller's gid and drop CAP_FSETID
-        // and that should make sure host kernel clears SGID.
-        //
-        // This probably will not work when we support idmapped mounts.
-        // In that case we will need to find a non-root gid and switch
-        // to it. (Instead of gid in request). Fix it when we support
-        // idmapped mounts.
+        // cleared. Let's do it explicitly by calling a chmod() syscall.
         let xattr_name = name.as_ref().to_str().unwrap();
-        let _clear_sgid_guard = if self.posix_acl.load(Ordering::Relaxed)
+        let must_clear_sgid = self.posix_acl.load(Ordering::Relaxed)
             && extra_flags.contains(SetxattrFlags::SETXATTR_ACL_KILL_SGID)
-            && xattr_name.eq("system.posix_acl_access")
-        {
-            let cap_guard = drop_effective_cap("FSETID")?;
-            let credentials_guard = UnixCredentials::new(ctx.uid, ctx.gid).set()?;
-
-            // If `UnixCredentials::set()` changes the effective user ID to non-zero, then the
-            // effective set is cleared from all capabilities. When switching back to root the
-            // permitted set is copied to the effective set. We need to keep `DAC_READ_SEARCH`
-            // to use file handles.
-            if self.cfg.inode_file_handles != InodeFileHandlesMode::Never {
-                if let Err(e) = crate::util::add_cap_to_eff("DAC_READ_SEARCH") {
-                    warn!(
-                        "failed to add 'DAC_READ_SEARCH' to the effective set of capabilities: {}",
-                        e
-                    );
-                }
-            }
-
-            (cap_guard, credentials_guard)
-        } else {
-            (None, None)
-        };
+            && xattr_name.eq("system.posix_acl_access");
 
         let res = if is_safe_inode(data.mode) {
             // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
@@ -2155,6 +2151,10 @@ impl FileSystem for PassthroughFs {
             let file = self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
 
             self.clear_file_capabilities(file.as_raw_fd(), false)?;
+
+            if must_clear_sgid {
+                self.clear_sgid(&file, false)?;
+            }
 
             // Safe because this doesn't modify any memory and we check the return value.
             unsafe {
@@ -2170,6 +2170,10 @@ impl FileSystem for PassthroughFs {
             let file = data.get_file()?;
 
             self.clear_file_capabilities(file.as_raw_fd(), true)?;
+
+            if must_clear_sgid {
+                self.clear_sgid(&file, true)?;
+            }
 
             let procname = CString::new(format!("{}", file.as_raw_fd()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;

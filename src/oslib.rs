@@ -113,6 +113,32 @@ pub fn fchdir(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
+/// Safe wrapper for `fchmod(2)`
+///
+/// # Errors
+///
+/// Will return `Err(errno)` if `fchmod(2)` fails.
+/// Each filesystem type may have its own special errors, see `fchmod(2)` for details.
+pub fn fchmod(fd: RawFd, mode: libc::mode_t) -> Result<()> {
+    check_retval(unsafe { libc::fchmod(fd, mode) })?;
+    Ok(())
+}
+
+/// Safe wrapper for `fchmodat(2)`
+///
+/// # Errors
+///
+/// Will return `Err(errno)` if `fchmodat(2)` fails.
+/// Each filesystem type may have its own special errors, see `fchmodat(2)` for details.
+pub fn fchmodat(dirfd: RawFd, pathname: String, mode: libc::mode_t, flags: i32) -> Result<()> {
+    let pathname =
+        CString::new(pathname).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let pathname = pathname.as_ptr();
+
+    check_retval(unsafe { libc::fchmodat(dirfd, pathname, mode, flags) })?;
+    Ok(())
+}
+
 /// Safe wrapper for `umask(2)`
 pub fn umask(mask: u32) -> u32 {
     // SAFETY: this call doesn't modify any memory and there is no need
