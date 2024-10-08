@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::convert::{self, TryFrom, TryInto};
 use std::ffi::CString;
 use std::fs::File;
+use std::io::{Read, Write};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::Path;
 use std::str::FromStr;
@@ -39,7 +40,7 @@ use virtiofsd::passthrough::{
     self, CachePolicy, InodeFileHandlesMode, MigrationMode, MigrationOnError, PassthroughFs,
 };
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
-use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
+use virtiofsd::seccomp::SeccompAction;
 use virtiofsd::server::Server;
 use virtiofsd::util::{other_io_error, write_pid_file};
 use virtiofsd::{limits, oslib, Error as VhostUserFsError};
@@ -48,6 +49,8 @@ use vm_memory::{
 };
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
+
+use vsock::{VsockAddr, VsockListener, VsockStream};
 
 const QUEUE_SIZE: usize = 32768;
 // The spec allows for multiple request queues. We currently only support one.
@@ -757,6 +760,14 @@ struct Opt {
     #[arg(long, required_unless_present_any = &["compat_options", "print_capabilities"])]
     shared_dir: Option<String>,
 
+    /// The port on which the vsock listener accepts connections
+    #[arg(long, required_unless_present_any = &["socket_path", "fd"])]
+    vsock_port: u32,
+
+    /// FUSE over VSOCK
+    #[arg(long, required_unless_present_any = &["socket_path", "fd"])]
+    vsock: bool,
+
     /// The tag that the virtio device advertises
     ///
     /// Setting this option will enable advertising of
@@ -768,12 +779,8 @@ struct Opt {
     #[arg(long, value_parser = parse_tag)]
     tag: Option<String>,
 
-    /// vhost-user socket path [deprecated]
-    #[arg(long, required_unless_present_any = &["fd", "socket_path", "print_capabilities"])]
-    socket: Option<String>,
-
     /// vhost-user socket path
-    #[arg(long = "socket-path", required_unless_present_any = &["fd", "socket", "print_capabilities"])]
+    #[arg(long = "socket-path", required_unless_present_any = &["fd", "print_capabilities", "vsock"])]
     socket_path: Option<String>,
 
     /// Name of group for the vhost-user socket
@@ -781,7 +788,7 @@ struct Opt {
     socket_group: Option<String>,
 
     /// File descriptor for the listening socket
-    #[arg(long, required_unless_present_any = &["socket", "socket_path", "print_capabilities"], conflicts_with_all = &["socket_path", "socket"])]
+    #[arg(long, required_unless_present_any = &["socket_path", "print_capabilities", "vsock"], conflicts_with_all = &["socket_path"])]
     fd: Option<RawFd>,
 
     /// Maximum thread pool size. A value of "0" disables the pool
@@ -1060,6 +1067,7 @@ fn parse_compat(opt: Opt) -> Opt {
             "security_label" => opt.security_label = true,
             "no_security_label" => opt.security_label = false,
             "no_posix_lock" | "no_flock" => (),
+            "vsock" => opt.vsock = true,
             _ => argument_error(option),
         }
     }
@@ -1229,6 +1237,30 @@ fn has_noatime_capability() -> bool {
     uid == 0 || capng::have_capability(capng::Type::EFFECTIVE, cap)
 }
 
+fn handle_vsock_connection(mut stream: VsockStream) -> std::io::Result<()> {
+    let mut buffer = [0; 4096];
+
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => {
+                // Connection closed
+                println!("Connection closed by client");
+                break;
+            }
+            Ok(bytes_read) => {
+                // Echo back the received data
+                stream.write(&buffer[..bytes_read])?;
+            }
+            Err(e) => {
+                error!("Error reading from stream: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn main() {
     let opt = parse_compat(Opt::parse());
 
@@ -1300,68 +1332,6 @@ fn main() {
             | libc::S_IXOTH
     };
 
-    // We need to keep _pid_file around because it maintains a lock on the pid file
-    // that prevents another daemon from using the same pid file.
-    let (listener, socket_path, _pid_file) = match opt.fd.as_ref() {
-        Some(fd) => unsafe { (Listener::from_raw_fd(*fd), None, None) },
-        None => {
-            // Set umask to ensure the socket is created with the right permissions
-            let _umask_guard = oslib::ScopedUmask::new(umask);
-
-            let socket = opt.socket_path.as_ref().unwrap_or_else(|| {
-                warn!("use of deprecated parameter '--socket': Please use the '--socket-path' option instead");
-                opt.socket.as_ref().unwrap() // safe to unwrap because clap ensures either --socket or --socket-path are passed
-            });
-
-            let socket_parent_dir = Path::new(socket).parent().unwrap_or_else(|| {
-                error!("Invalid socket file name");
-                process::exit(1);
-            });
-
-            if !socket_parent_dir.as_os_str().is_empty() && !socket_parent_dir.exists() {
-                error!(
-                    "{} does not exist or is not a directory",
-                    socket_parent_dir.to_string_lossy()
-                );
-                process::exit(1);
-            }
-
-            let pid_file_name = socket.to_owned() + ".pid";
-            let pid_file_path = Path::new(pid_file_name.as_str());
-            let pid_file = write_pid_file(pid_file_path).unwrap_or_else(|error| {
-                error!("Error creating pid file '{}': {}", pid_file_name, error);
-                process::exit(1);
-            });
-
-            let listener = Listener::new(socket, true).unwrap_or_else(|error| {
-                error!("Error creating listener: {}", error);
-                process::exit(1);
-            });
-
-            (listener, Some(socket.clone()), Some(pid_file))
-        }
-    };
-
-    if let Some(group_name) = opt.socket_group {
-        let c_name = CString::new(group_name).expect("invalid group name");
-        let group = unsafe { libc::getgrnam(c_name.as_ptr()) };
-        if group.is_null() {
-            error!("Couldn't resolve the group name specified for the socket path");
-            process::exit(1);
-        }
-
-        // safe to unwrap because clap ensures --socket-group can't be specified alongside --fd
-        let c_socket_path = CString::new(socket_path.unwrap()).expect("invalid socket path");
-        let ret = unsafe { libc::chown(c_socket_path.as_ptr(), u32::MAX, (*group).gr_gid) };
-        if ret != 0 {
-            error!(
-                "Couldn't set up the group for the socket path: {}",
-                std::io::Error::last_os_error()
-            );
-            process::exit(1);
-        }
-    }
-
     limits::setup_rlimit_nofile(opt.rlimit_nofile).unwrap_or_else(|error| {
         error!("Error increasing number of open files: {}", error);
         process::exit(1)
@@ -1375,13 +1345,6 @@ fn main() {
     )
     .unwrap_or_else(|error| {
         error!("Error creating sandbox: {}", error);
-        process::exit(1)
-    });
-
-    // Enter the sandbox, from this point the process will be isolated (or not)
-    // as chosen in '--sandbox'.
-    let listener = sandbox.enter(listener).unwrap_or_else(|error| {
-        error!("Error entering sandbox: {}", error);
         process::exit(1)
     });
 
@@ -1412,17 +1375,11 @@ fn main() {
         ..Default::default()
     };
 
-    // Must happen before we start the thread pool
-    match opt.seccomp {
-        SeccompAction::Allow => {}
-        _ => enable_seccomp(opt.seccomp, opt.syslog).unwrap(),
-    }
-
     // We don't modify the capabilities if the user call us without
     // any sandbox (i.e. --sandbox=none) as unprivileged user
     let uid = unsafe { libc::geteuid() };
     if uid == 0 {
-        drop_capabilities(fs_cfg.inode_file_handles, opt.modcaps);
+        drop_capabilities(fs_cfg.inode_file_handles, opt.modcaps.clone());
     }
 
     let fs = match PassthroughFs::new(fs_cfg) {
@@ -1436,44 +1393,133 @@ fn main() {
         }
     };
 
-    let fs_backend = Arc::new(
-        VhostUserFsBackend::new(fs, thread_pool_size, opt.tag).unwrap_or_else(|error| {
-            error!("Error creating vhost-user backend: {}", error);
-            process::exit(1)
-        }),
-    );
+    if opt.vsock {
+        let listener = VsockListener::bind(&VsockAddr::new(libc::VMADDR_CID_ANY, opt.vsock_port))
+            .expect("bind and listen failed");
 
-    let mut daemon = VhostUserDaemon::new(
-        String::from("virtiofsd-backend"),
-        fs_backend.clone(),
-        GuestMemoryAtomic::new(GuestMemoryMmap::new()),
-    )
-    .unwrap();
-
-    info!("Waiting for vhost-user socket connection...");
-
-    if let Err(e) = daemon.start(listener) {
-        error!("Failed to start daemon: {:?}", e);
-        process::exit(1);
-    }
-
-    info!("Client connected, servicing requests");
-
-    if let Err(e) = daemon.wait() {
-        match e {
-            HandleRequest(Disconnected) => info!("Client disconnected, shutting down"),
-            _ => error!("Waiting for daemon failed: {:?}", e),
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    std::thread::spawn(move || {
+                        if let Err(e) = handle_vsock_connection(stream) {
+                            error!("Error handling connection: {}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Error accepting connection: {}", e);
+                }
+            }
         }
-    }
+    } else {
+        // We need to keep _pid_file around because it maintains a lock on the pid file
+        // that prevents another daemon from using the same pid file.
+        let (listener, socket_path, _pid_file) = match opt.fd.as_ref() {
+            Some(fd) => unsafe { (Listener::from_raw_fd(*fd), None, None) },
+            None => {
+                // Set umask to ensure the socket is created with the right permissions
+                let _umask_guard = oslib::ScopedUmask::new(umask);
 
-    let kill_evt = fs_backend
-        .thread
-        .read()
-        .unwrap()
-        .kill_evt
-        .try_clone()
+                let socket = opt.socket_path.as_ref().unwrap_or_else(|| {
+                    error!("socket-path not provided");
+                    process::exit(1);
+                });
+
+                let socket_parent_dir = Path::new(socket).parent().unwrap_or_else(|| {
+                    error!("Invalid socket file name");
+                    process::exit(1);
+                });
+
+                if !socket_parent_dir.as_os_str().is_empty() && !socket_parent_dir.exists() {
+                    error!(
+                        "{} does not exist or is not a directory",
+                        socket_parent_dir.to_string_lossy()
+                    );
+                    process::exit(1);
+                }
+
+                let pid_file_name = socket.to_owned() + ".pid";
+                let pid_file_path = Path::new(pid_file_name.as_str());
+                let pid_file = write_pid_file(pid_file_path).unwrap_or_else(|error| {
+                    error!("Error creating pid file '{}': {}", pid_file_name, error);
+                    process::exit(1);
+                });
+
+                let listener = Listener::new(socket, true).unwrap_or_else(|error| {
+                    error!("Error creating listener: {}", error);
+                    process::exit(1);
+                });
+
+                (listener, Some(socket.clone()), Some(pid_file))
+            }
+        };
+
+        if let Some(group_name) = opt.socket_group {
+            let c_name = CString::new(group_name).expect("invalid group name");
+            let group = unsafe { libc::getgrnam(c_name.as_ptr()) };
+            if group.is_null() {
+                error!("Couldn't resolve the group name specified for the socket path");
+                process::exit(1);
+            }
+
+            // safe to unwrap because clap ensures --socket-group can't be specified alongside --fd
+            let c_socket_path = CString::new(socket_path.unwrap()).expect("invalid socket path");
+            let ret = unsafe { libc::chown(c_socket_path.as_ptr(), u32::MAX, (*group).gr_gid) };
+            if ret != 0 {
+                error!(
+                    "Couldn't set up the group for the socket path: {}",
+                    std::io::Error::last_os_error()
+                );
+                process::exit(1);
+            }
+        }
+
+        // Enter the sandbox, from this point the process will be isolated (or not)
+        // as chosen in '--sandbox'.
+        let listener = sandbox.enter(listener).unwrap_or_else(|error| {
+            error!("Error entering sandbox: {}", error);
+            process::exit(1)
+        });
+
+        let fs_backend = Arc::new(
+            VhostUserFsBackend::new(fs, thread_pool_size, opt.tag).unwrap_or_else(|error| {
+                error!("Error creating vhost-user backend: {}", error);
+                process::exit(1)
+            }),
+        );
+
+        let mut daemon = VhostUserDaemon::new(
+            String::from("virtiofsd-backend"),
+            fs_backend.clone(),
+            GuestMemoryAtomic::new(GuestMemoryMmap::new()),
+        )
         .unwrap();
-    if let Err(e) = kill_evt.write(1) {
-        error!("Error shutting down worker thread: {:?}", e)
+
+        info!("Waiting for vhost-user socket connection...");
+
+        if let Err(e) = daemon.start(listener) {
+            error!("Failed to start daemon: {:?}", e);
+            process::exit(1);
+        }
+
+        info!("Client connected, servicing requests");
+
+        if let Err(e) = daemon.wait() {
+            match e {
+                HandleRequest(Disconnected) => info!("Client disconnected, shutting down"),
+                _ => error!("Waiting for daemon failed: {:?}", e),
+            }
+        }
+
+        let kill_evt = fs_backend
+            .thread
+            .read()
+            .unwrap()
+            .kill_evt
+            .try_clone()
+            .unwrap();
+        if let Err(e) = kill_evt.write(1) {
+            error!("Error shutting down worker thread: {:?}", e)
+        }
     }
 }
