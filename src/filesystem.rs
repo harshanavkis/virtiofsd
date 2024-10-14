@@ -747,6 +747,17 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
+    fn read_vsock_version(
+        &self,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        buffer: &mut [u8],
+        size: u32,
+        offset: u64,
+    ) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
     /// Write data to a file.
     ///
     /// Writes `size` bytes of data starting from offset `off` to the file associated with `inode`
@@ -779,6 +790,19 @@ pub trait FileSystem {
         delayed_write: bool,
         kill_priv: bool,
         flags: u32,
+    ) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    fn write_vsock_version(
+        &self,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        buffer: &[u8],
+        size: u32,
+        offset: u64,
+        delayed_write: bool,
+        kill_priv: bool,
     ) -> io::Result<usize> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }

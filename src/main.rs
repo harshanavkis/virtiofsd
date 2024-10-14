@@ -10,7 +10,6 @@ use std::collections::HashSet;
 use std::convert::{self, TryFrom, TryInto};
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{Read, Write};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::Path;
 use std::str::FromStr;
@@ -51,6 +50,8 @@ use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 
 use vsock::{VsockAddr, VsockListener, VsockStream};
+
+use virtiofsd::vsock_fuse_server::VsockFuseServer;
 
 const QUEUE_SIZE: usize = 32768;
 // The spec allows for multiple request queues. We currently only support one.
@@ -1237,19 +1238,20 @@ fn has_noatime_capability() -> bool {
     uid == 0 || capng::have_capability(capng::Type::EFFECTIVE, cap)
 }
 
-fn handle_vsock_connection(mut stream: VsockStream) -> std::io::Result<()> {
-    let mut buffer = [0; 4096];
-
+fn handle_vsock_connection<F: FileSystem + Send + Sync + 'static>(
+    mut stream: VsockStream,
+    server: &mut VsockFuseServer<F>,
+) -> std::io::Result<()> {
     loop {
-        match stream.read(&mut buffer) {
+        match server.handle_message(&mut stream) {
             Ok(0) => {
                 // Connection closed
                 println!("Connection closed by client");
                 break;
             }
-            Ok(bytes_read) => {
+            Ok(_) => {
                 // Echo back the received data
-                stream.write(&buffer[..bytes_read])?;
+                // stream.write(&buffer[..bytes_read])?;
             }
             Err(e) => {
                 error!("Error reading from stream: {}", e);
@@ -1397,20 +1399,27 @@ fn main() {
         let listener = VsockListener::bind(&VsockAddr::new(libc::VMADDR_CID_ANY, opt.vsock_port))
             .expect("bind and listen failed");
 
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    std::thread::spawn(move || {
-                        if let Err(e) = handle_vsock_connection(stream) {
-                            error!("Error handling connection: {}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Error accepting connection: {}", e);
-                }
+        let mut vsock_fuse_server = VsockFuseServer::new(fs);
+
+        // for stream in listener.incoming() {
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                debug!(
+                    "Received connection from CID: {}, Port: {}",
+                    addr.cid(),
+                    addr.port()
+                );
+                std::thread::spawn(move || {
+                    if let Err(e) = handle_vsock_connection(stream, &mut vsock_fuse_server) {
+                        error!("Error handling connection: {}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Error accepting connection: {}", e);
             }
         }
+        //}
     } else {
         // We need to keep _pid_file around because it maintains a lock on the pid file
         // that prevents another daemon from using the same pid file.

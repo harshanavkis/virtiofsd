@@ -20,6 +20,7 @@ pub mod sandbox;
 pub mod seccomp;
 pub mod server;
 pub mod util;
+pub mod vsock_fuse_server;
 
 use std::ffi::{FromBytesWithNulError, FromVecWithNulError};
 use std::{error, fmt, io};
@@ -45,6 +46,10 @@ pub enum Error {
     InvalidXattrSize((u32, usize)),
     /// One or more extensions are missing.
     MissingExtension,
+    /// Not implemented
+    OpNotImplemented,
+    /// Failed data transfer via vsock
+    DataTransferFailed,
 }
 
 impl error::Error for Error {}
@@ -66,6 +71,8 @@ impl fmt::Display for Error {
                  decoded value: size = {size}, value.len() = {len}"
             ),
             MissingExtension => write!(f, "one or more extensions are missing"),
+            OpNotImplemented => write!(f, "this operation has not been implemented"),
+            DataTransferFailed => write!(f, "bulk data transfer via vsock failed"),
         }
     }
 }

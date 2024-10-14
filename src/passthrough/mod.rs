@@ -31,8 +31,8 @@ use std::borrow::Cow;
 use std::collections::{btree_map, BTreeMap};
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io;
-use std::io::ErrorKind;
+use std::io::{self, Seek, Write};
+use std::io::{ErrorKind, Read};
 use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
@@ -1620,6 +1620,25 @@ impl FileSystem for PassthroughFs {
         w.write_from(&f, size as usize, offset)
     }
 
+    fn read_vsock_version(
+        &self,
+        inode: Inode,
+        handle: Handle,
+        buffer: &mut [u8],
+        size: u32,
+        offset: u64,
+    ) -> io::Result<usize> {
+        let data = self.find_handle(handle, inode)?;
+
+        // This is safe because write_from uses preadv64, so the underlying file descriptor
+        // offset is not affected by this operation.
+        let mut f = data.file.get()?.write().unwrap();
+        f.seek(io::SeekFrom::Start(offset))?;
+        f.read_exact(buffer)?;
+
+        Ok(size as usize)
+    }
+
     fn write<R: io::Read + ZeroCopyReader>(
         &self,
         _ctx: Context,
@@ -1660,6 +1679,41 @@ impl FileSystem for PassthroughFs {
             let is_append = flags & libc::O_APPEND as u32 != 0;
             let flags = (!delayed_write && is_append).then_some(oslib::WritevFlags::RWF_APPEND);
             r.read_to(&f, size as usize, offset, flags)
+        }
+    }
+
+    fn write_vsock_version(
+        &self,
+        inode: Inode,
+        handle: Handle,
+        buffer: &[u8],
+        size: u32,
+        offset: u64,
+        _delayed_write: bool,
+        kill_priv: bool,
+    ) -> io::Result<usize> {
+        let data = self.find_handle(handle, inode)?;
+
+        // This is safe because read_to uses `pwritev2(2)`, so the underlying file descriptor
+        // offset is not affected by this operation.
+        let mut f = data.file.get()?.write().unwrap();
+
+        {
+            let _killpriv_guard = if self.cfg.killpriv_v2 && kill_priv {
+                // We need to drop FSETID during a write so that the kernel will remove setuid
+                // or setgid bits from the file if it was written to by someone other than the
+                // owner.
+                drop_effective_cap("FSETID")?
+            } else {
+                None
+            };
+
+            self.clear_file_capabilities(f.as_raw_fd(), false)?;
+
+            f.seek(io::SeekFrom::Start(offset))?;
+            f.write_all(buffer)?;
+
+            Ok(size as usize)
         }
     }
 
