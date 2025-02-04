@@ -762,12 +762,12 @@ struct Opt {
     shared_dir: Option<String>,
 
     /// The port on which the vsock listener accepts connections
-    #[arg(long, required_unless_present_any = &["socket_path", "fd"])]
-    vsock_port: u32,
+    // #[arg(long, required_unless_present_any = &["socket_path", "fd"])]
+    // vsock_port: u32,
 
     /// FUSE over VSOCK
     #[arg(long, required_unless_present_any = &["socket_path", "fd"])]
-    vsock: bool,
+    vsock: Option<u32>,
 
     /// The tag that the virtio device advertises
     ///
@@ -1068,7 +1068,7 @@ fn parse_compat(opt: Opt) -> Opt {
             "security_label" => opt.security_label = true,
             "no_security_label" => opt.security_label = false,
             "no_posix_lock" | "no_flock" => (),
-            "vsock" => opt.vsock = true,
+            // "vsock" => opt.vsock = true,
             _ => argument_error(option),
         }
     }
@@ -1395,8 +1395,8 @@ fn main() {
         }
     };
 
-    if opt.vsock {
-        let listener = VsockListener::bind(&VsockAddr::new(libc::VMADDR_CID_ANY, opt.vsock_port))
+    if let Some(vsock_port) = opt.vsock {
+        let listener = VsockListener::bind(&VsockAddr::new(libc::VMADDR_CID_ANY, vsock_port))
             .expect("bind and listen failed");
 
         let mut vsock_fuse_server = VsockFuseServer::new(fs);
@@ -1409,11 +1409,9 @@ fn main() {
                     addr.cid(),
                     addr.port()
                 );
-                std::thread::spawn(move || {
-                    if let Err(e) = handle_vsock_connection(stream, &mut vsock_fuse_server) {
-                        error!("Error handling connection: {}", e);
-                    }
-                });
+                if let Err(e) = handle_vsock_connection(stream, &mut vsock_fuse_server) {
+                    error!("Error handling connection: {}", e);
+                }
             }
             Err(e) => {
                 error!("Error accepting connection: {}", e);

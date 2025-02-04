@@ -31,9 +31,10 @@ use std::borrow::Cow;
 use std::collections::{btree_map, BTreeMap};
 use std::ffi::{CStr, CString};
 use std::fs::File;
+use std::io::ErrorKind;
 use std::io::{self, Seek, Write};
-use std::io::{ErrorKind, Read};
 use std::mem::MaybeUninit;
+use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1629,14 +1630,29 @@ impl FileSystem for PassthroughFs {
         offset: u64,
     ) -> io::Result<usize> {
         let data = self.find_handle(handle, inode)?;
+        let f = data.file.get()?.write().unwrap();
 
-        // This is safe because write_from uses preadv64, so the underlying file descriptor
-        // offset is not affected by this operation.
-        let mut f = data.file.get()?.write().unwrap();
-        f.seek(io::SeekFrom::Start(offset))?;
-        f.read_exact(buffer)?;
+        let file_size = f.metadata()?.len();
+        debug!(
+            "read_vsock_version: fsize: {:?}, offset: {:?}, size: {:?}",
+            file_size, offset, size
+        );
 
-        Ok(size as usize)
+        // If offset is beyond the file size, return 0 (EOF)
+        if offset >= file_size {
+            return Ok(0);
+        }
+
+        // Limit the read size to avoid reading past EOF
+        let max_read_size = (file_size - offset) as usize;
+        let read_size = std::cmp::min(size as usize, max_read_size);
+
+        let mut temp_buffer = vec![0; read_size];
+        f.read_exact_at(&mut temp_buffer, offset)?;
+        buffer[..read_size].copy_from_slice(&temp_buffer);
+
+        debug!("read_vsock_version: read size: {:?}", read_size);
+        Ok(read_size)
     }
 
     fn write<R: io::Read + ZeroCopyReader>(

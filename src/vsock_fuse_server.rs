@@ -55,6 +55,7 @@ impl<F: FileSystem + Sync> VsockFuseServer<F> {
     #[allow(clippy::cognitive_complexity)]
     pub fn handle_message(&mut self, vsock_stream: &mut VsockStream) -> Result<usize> {
         let in_header: InHeader = self.read_obj(vsock_stream).map_err(Error::DecodeMessage)?;
+        debug!("vsock_fuse_server: handle_message");
 
         if in_header.len > (MAX_BUFFER_SIZE + FUSE_BUFFER_HEADER_SIZE) {
             return reply_error(
@@ -153,7 +154,15 @@ impl<F: FileSystem + Sync> VsockFuseServer<F> {
 
                 reply_ok(Some(out), None, in_header.unique, vsock_stream)
             }
-            Err(e) => reply_error(e, in_header.unique, vsock_stream),
+            // TODO: Do it more elegantly, perhaps on the guest side
+            Err(e) => {
+                let data = [0];
+                let err = reply_error(e, in_header.unique, vsock_stream);
+                vsock_stream
+                    .write_all(&data)
+                    .map_err(Error::EncodeMessage)?;
+                err
+            }
         }
     }
 
@@ -236,7 +245,15 @@ impl<F: FileSystem + Sync> VsockFuseServer<F> {
                 // We need to disambiguate the option type here even though it is `None`.
                 reply_ok(None::<u8>, Some(&linkname), in_header.unique, vsock_stream)
             }
-            Err(e) => reply_error(e, in_header.unique, vsock_stream),
+            // TODO: Do it more elegantly, perhaps on the guest side
+            Err(e) => {
+                let data = [0];
+                let err = reply_error(e, in_header.unique, vsock_stream);
+                vsock_stream
+                    .write_all(&data)
+                    .map_err(Error::EncodeMessage)?;
+                err
+            }
         }
     }
 
@@ -538,7 +555,15 @@ impl<F: FileSystem + Sync> VsockFuseServer<F> {
                 vsock_stream.write_all(&read_buffer).unwrap();
                 Ok(out.len as usize)
             }
-            Err(e) => reply_error(e, in_header.unique, vsock_stream),
+            // TODO: Do it more elegantly, perhaps on the guest side
+            Err(e) => {
+                let data = [0];
+                let err = reply_error(e, in_header.unique, vsock_stream);
+                vsock_stream
+                    .write_all(&data)
+                    .map_err(Error::EncodeMessage)?;
+                err
+            }
         }
     }
 
